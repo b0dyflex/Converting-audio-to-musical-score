@@ -2,9 +2,11 @@ import subprocess
 import os
 import sys
 from pathlib import Path
-import glob
+import time
+import shutil
 
 SUPPORTED_EXTENSIONS = ['.musicxml', '.xml', '.mxl']
+
 
 def find_musescore():
     """Поиск MuseScore в системе"""
@@ -22,9 +24,9 @@ def find_musescore():
                 possible_paths.extend([
                     f"{pf}\\MuseScore 4\\bin\\MuseScore4.exe",
                     f"{pf}\\MuseScore 3\\bin\\MuseScore3.exe",
-                    f"{pf}\\MuseScore 2\\bin\\MuseScore.exe"
+                    f"{pf}\\MuseScore 2\\bin\\MuseScore.exe",
                 ])
-        possible_paths.extend(["mscore", "musescore"])
+        possible_paths.extend(["MuseScore4.exe", "MuseScore3.exe", "mscore", "musescore"])
 
     # macOS
     elif sys.platform == 'darwin':
@@ -40,6 +42,8 @@ def find_musescore():
     else:
         possible_paths.extend([
             "/usr/bin/musescore",
+            "/usr/bin/musescore4",
+            "/usr/bin/musescore3",
             "/usr/bin/mscore",
             "/usr/local/bin/musescore",
             "musescore",
@@ -56,18 +60,19 @@ def find_musescore():
 
 def check_program_exists(path):
     """Проверка существования программы"""
-    if path in ['musescore', 'mscore']:
+    if path in ['musescore', 'mscore', 'musescore4', 'musescore3', 'MuseScore4.exe', 'MuseScore3.exe']:
         try:
             if sys.platform == 'win32':
                 result = subprocess.run(['where', path],
                                         capture_output=True,
                                         text=True,
-                                        timeout=2)
+                                        timeout=5,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
             else:
                 result = subprocess.run(['which', path],
                                         capture_output=True,
                                         text=True,
-                                        timeout=2)
+                                        timeout=5)
             return result.returncode == 0
         except:
             return False
@@ -75,378 +80,410 @@ def check_program_exists(path):
         return os.path.exists(path)
 
 
+def normalize_path(path):
+    """Нормализация пути для Windows"""
+    path = str(path)
+    if sys.platform == 'win32':
+        # Заменяем слеши и убираем кавычки
+        path = path.replace('/', '\\')
+        path = path.strip('"').strip("'")
+    return os.path.abspath(path)
+
+
+def check_file_access(file_path):
+    """Проверка доступа к файлу"""
+    file_path = normalize_path(file_path)
+
+    checks = []
+
+    # Проверка существования
+    if not os.path.exists(file_path):
+        return False, f"Файл не существует: {file_path}"
+
+    # Проверка доступа на чтение
+    if not os.access(file_path, os.R_OK):
+        return False, f"Нет доступа на чтение: {file_path}"
+
+    # Проверка, что это файл, а не папка
+    if not os.path.isfile(file_path):
+        return False, f"Это папка, а не файл: {file_path}"
+
+    # Проверка размера
+    try:
+        size = os.path.getsize(file_path)
+        if size == 0:
+            return False, f"Файл пустой: {file_path}"
+        if size > 500 * 1024 * 1024:  # 500 MB
+            return False, f"Файл слишком большой ({size / 1024 / 1024:.1f} MB)"
+    except:
+        return False, f"Не удалось проверить размер файла: {file_path}"
+
+    return True, "OK"
+
+
+def check_output_directory(output_path):
+    """Проверка возможности записи в выходную директорию"""
+    output_path = normalize_path(output_path)
+    output_dir = os.path.dirname(output_path) or os.getcwd()
+
+    # Проверяем существование директории
+    if not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except:
+            return False, f"Не удалось создать директорию: {output_dir}"
+
+    # Проверяем доступ на запись
+    if not os.access(output_dir, os.W_OK):
+        return False, f"Нет доступа на запись в директорию: {output_dir}"
+
+    return True, "OK"
+
+
 def convert_musicxml_to_pdf(input_path, output_path, musescore_path):
     """
     Конвертирует MusicXML файл в PDF используя MuseScore
     """
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Файл не найден: {input_path}")
+    # Нормализуем пути
+    input_path = normalize_path(input_path)
+    output_path = normalize_path(output_path)
+    musescore_path = normalize_path(musescore_path)
 
-    print(f"\nКонвертация: {input_path} -> {output_path}")
+    print(f"\nКонвертация: {Path(input_path).name}")
+    print(f"Входной файл: {input_path}")
+    print(f"Выходной файл: {output_path}")
+
+    # Проверяем доступ к файлам
+    input_check, input_msg = check_file_access(input_path)
+    if not input_check:
+        print(f"\n✗ Проблема с входным файлом: {input_msg}")
+        return False
+
+    output_check, output_msg = check_output_directory(output_path)
+    if not output_check:
+        print(f"\n✗ Проблема с выходной директорией: {output_msg}")
+        return False
+
+    # Проверяем MuseScore
+    if not os.path.exists(musescore_path):
+        print(f"\n✗ MuseScore не найден: {musescore_path}")
+        return False
 
     try:
-        # Формируем команду
-        cmd = [musescore_path, "-o", str(output_path), input_path]
-        print(f"Использую: {musescore_path}")
+        print("\nЗапуск MuseScore...")
+        start_time = time.time()
 
-        # Запускаем процесс конвертации
-        print("Конвертация... (может занять некоторое время)")
+        # Базовая команда
+        cmd = [musescore_path, "-o", output_path, input_path]
+
+        # Показываем команду для отладки
+        if len(' '.join(cmd)) < 200:  # Не показываем слишком длинные команды
+            print(f"Команда: {' '.join(cmd)}")
+
+        # Настройки для subprocess в зависимости от платформы
+        creation_flags = 0
+        if sys.platform == 'win32':
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
+        # Запускаем конвертацию
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=3600,  # 1 час таймаут
+            encoding='utf-8',
+            errors='ignore',
+            creationflags=creation_flags
         )
 
+        elapsed = time.time() - start_time
+
+        # Проверяем результат
         if result.returncode == 0:
-            if os.path.exists(output_path):
-                size = os.path.getsize(output_path) / 1024
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                pdf_size = os.path.getsize(output_path) / 1024
                 print(f"\nУспешно создан: {output_path}")
-                print(f"Размер PDF: {size:.1f} KB")
+                print(f"  Размер PDF: {pdf_size:.1f} KB")
+                print(f"  Время конвертации: {elapsed // 60:.0f} мин {elapsed % 60:.1f} сек")
                 return True
             else:
-                print("⚠ PDF файл не найден после конвертации")
+                print("\nPDF файл не создан или пустой")
                 return False
         else:
-            print(f"\nОшибка MuseScore (код: {result.returncode}):")
-            if result.stderr:
-                error_msg = result.stderr[:300]
-                print(f"Ошибка: {error_msg}")
+            print(f"\nОшибка MuseScore (код: {result.returncode})")
+
+            # Анализируем ошибку
+            error_info = analyze_musescore_error(result.returncode, result.stderr, result.stdout)
+
+            print("\nДетали ошибки:")
+            print("-" * 50)
+            for line in error_info.split('\n'):
+                if line.strip():
+                    print(f"  {line}")
+            print("-" * 50)
+
             return False
 
     except subprocess.TimeoutExpired:
-        print("Таймаут конвертации")
+        print(f"\nТаймаут конвертации (1 час)")
+        print("Возможно, файл слишком большой или MuseScore завис")
         return False
+
     except Exception as e:
-        print(f"Неожиданная ошибка: {e}")
+        print(f"\nНеожиданная ошибка: {str(e)}")
         return False
 
 
-# ==================== ФУНКЦИИ ДЛЯ ВВОДА ФАЙЛОВ ====================
+def analyze_musescore_error(returncode, stderr, stdout):
+    """Анализ ошибок MuseScore"""
+    error_text = stderr or stdout or ""
 
-def get_file_input_method():
-    """Выбор способа ввода файла"""
+    # Коды ошибок Windows
+    if returncode == 1320:
+        return "Ошибка 1320: Проблема с доступом к файлу или директории.\n" \
+               "Возможные причины:\n" \
+               "1. Файл открыт в другой программе\n" \
+               "2. Нет прав на запись в папку\n" \
+               "3. Слишком длинный путь к файлу\n" \
+               "4. Специальные символы в пути"
+
+    elif returncode == 5:
+        return "Ошибка 5: Доступ запрещен.\n" \
+               "Проверьте права доступа к файлам."
+
+    elif returncode == 2:
+        return "Ошибка 2: Файл не найден.\n" \
+               "Проверьте путь к входному файлу."
+
+    # Анализ текста ошибки
+    error_lower = error_text.lower()
+
+    if "permission" in error_lower or "access" in error_lower:
+        return "Ошибка доступа. Проверьте:\n" \
+               "1. Закройте файл в других программах\n" \
+               "2. Запустите программу от имени администратора\n" \
+               "3. Проверьте антивирус"
+
+    elif "corrupt" in error_lower:
+        return "Файл поврежден или имеет неверный формат."
+
+    elif "memory" in error_lower:
+        return "Нехватка памяти. Закройте другие программы."
+
+    elif "timeout" in error_lower:
+        return "Таймаут операции. Файл слишком большой."
+
+    # Общий случай
+    if error_text.strip():
+        # Берем последние 3 строки ошибки
+        lines = [line.strip() for line in error_text.split('\n') if line.strip()]
+        last_lines = lines[-3:] if len(lines) > 3 else lines
+        return '\n'.join(last_lines)
+
+    return f"Код ошибки: {returncode}"
+
+
+def get_input_file():
+    """Упрощенная функция получения входного файла"""
     print("\n" + "=" * 60)
     print("   ВЫБОР ФАЙЛА")
     print("=" * 60)
 
-    print("\nВыберите способ ввода файла:")
-    print("1. Ввести путь вручную (или перетащить файл)")
-    print("2. Выбрать из файлов в текущей папке")
-    print("3. Поиск файлов по имени")
-
     while True:
-        choice = input("\nВаш выбор (1-3): ").strip()
-        if choice in ['1', '2', '3']:
-            return choice
-        print("Неверный выбор. Введите 1, 2 или 3.")
+        print("\nВведите путь к MusicXML файлу или перетащите файл в окно:")
+        print(f"Поддерживаемые форматы: {', '.join(SUPPORTED_EXTENSIONS)}")
 
-
-def manual_file_input():
-    """Ручной ввод пути к файлу"""
-    print("\nВведите путь к MusicXML файлу или перетащите файл в окно терминала.")
-    print(f"Поддерживаемые форматы: {', '.join(SUPPORTED_EXTENSIONS)}")
-
-    while True:
         path = input("\nПуть к файлу: ").strip()
-
-        # Удаление кавычек для drag-and-drop
-        path = path.strip('"').strip("'")
 
         if not path:
             print("Путь не может быть пустым.")
             continue
 
-        if os.path.exists(path):
-            # Проверяем расширение
-            ext = Path(path).suffix.lower()
-            if ext in SUPPORTED_EXTENSIONS:
-                return path
-            else:
-                print(f"⚠ Файл имеет нестандартное расширение: {ext}")
-                proceed = input("Все равно продолжить? (y/n): ").lower()
-                if proceed in ['y', 'yes', 'д', 'да']:
-                    return path
-        else:
-            print(f"Файл не найден: {path}")
+        # Очистка пути
+        path = path.strip('"').strip("'")
+        path = normalize_path(path)
+
+        # Проверка существования
+        if not os.path.exists(path):
+            print(f"✗ Файл не найден: {path}")
             retry = input("Попробовать другой путь? (y/n): ").lower()
             if retry not in ['y', 'yes', 'д', 'да']:
                 return None
+            continue
 
+        # Проверка расширения
+        ext = Path(path).suffix.lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            print(f"⚠ Файл имеет нестандартное расширение: {ext}")
+            proceed = input("Все равно продолжить? (y/n): ").lower()
+            if proceed not in ['y', 'yes', 'д', 'да']:
+                continue
 
-def browse_current_directory():
-    """Просмотр файлов в текущей папке"""
-    current_dir = os.getcwd()
-    print(f"\nТекущая папка: {current_dir}")
-
-    # Ищем MusicXML файлы
-    files = []
-    for ext in SUPPORTED_EXTENSIONS:
-        files.extend(glob.glob(f"*{ext}"))
-
-    if not files:
-        print("Не найдено MusicXML файлов в текущей папке.")
-        return None
-
-    # Сортируем файлы
-    files.sort()
-
-    print(f"\nНайдено {len(files)} файлов:")
-    print("-" * 50)
-
-    for i, file in enumerate(files, 1):
-        size = os.path.getsize(file) / 1024  # Размер в KB
-        filename = Path(file).name
-        print(f"{i:3}. {filename:35} ({size:.1f} KB)")
-
-    print("-" * 50)
-
-    while True:
-        try:
-            choice = input("\nВыберите номер файла (или 0 для отмены): ").strip()
-
-            if choice == '0':
-                return None
-
-            idx = int(choice) - 1
-            if 0 <= idx < len(files):
-                selected_file = files[idx]
-                print(f"Выбран файл: {selected_file}")
-                return selected_file
-            else:
-                print(f"Неверный номер. Введите число от 1 до {len(files)}")
-
-        except ValueError:
-            print("Пожалуйста, введите число")
-
-
-def search_files():
-    """Поиск файлов по имени или маске"""
-    print("\nПоиск файлов по имени или маске")
-    print("Примеры: '*.musicxml', 'score*', '*part*.xml'")
-
-    pattern = input("\nВведите маску для поиска: ").strip()
-
-    if not pattern:
-        pattern = "*.musicxml"
-        print(f"Используется маска по умолчанию: {pattern}")
-
-    files = glob.glob(pattern)
-
-    if not files:
-        print(f"Не найдено файлов по маске: {pattern}")
-        return None
-
-    # Фильтруем только поддерживаемые расширения
-    filtered_files = [
-        f for f in files
-        if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS or
-           input(f"Файл '{f}' имеет нестандартное расширение. Включить его? (y/n): ").lower() in ['y', 'yes', 'д', 'да']
-    ]
-
-    if not filtered_files:
-        print("Нет файлов с поддерживаемыми расширениями.")
-        return None
-
-    print(f"\nНайдено {len(filtered_files)} файлов:")
-    for i, file in enumerate(filtered_files[:20], 1):
-        print(f"{i:3}. {file}")
-
-    if len(filtered_files) > 20:
-        print(f"... и еще {len(filtered_files) - 20} файлов")
-
-    while True:
-        try:
-            choice = input("\nВыберите номер файла (или 0 для отмены): ").strip()
-
-            if choice == '0':
-                return None
-
-            idx = int(choice) - 1
-            if 0 <= idx < len(filtered_files):
-                return filtered_files[idx]
-            else:
-                print(f"Неверный номер. Введите число от 1 до {len(filtered_files)}")
-        except ValueError:
-            print("Пожалуйста, введите число")
-
-
-def get_input_file():
-    """Основная функция получения входного файла"""
-    method = get_file_input_method()
-
-    if method == '1':
-        return manual_file_input()
-    elif method == '2':
-        return browse_current_directory()
-    elif method == '3':
-        return search_files()
-
-    return None
+        print(f"✓ Выбран файл: {path}")
+        return path
 
 
 def get_output_filename(input_file):
     """Получение имени выходного файла"""
     input_path = Path(input_file)
-    default_output = input_path.with_suffix('.pdf')
+
+    # Создаем имя файла без пробелов и специальных символов
+    safe_name = input_path.stem.replace(' ', '_').replace('(', '').replace(')', '')
+    safe_name = ''.join(c for c in safe_name if c.isalnum() or c in '._-')
+    default_output = input_path.with_name(safe_name).with_suffix('.pdf')
 
     while True:
-        output_file = input(f"\nИмя PDF файла [Enter для '{default_output}']: ").strip()
+        print(f"\nИмя выходного PDF файла:")
+        print(f"По умолчанию: {default_output}")
+
+        output_file = input("Введите имя файла или нажмите Enter для использования значения по умолчанию: ").strip()
 
         if not output_file:
             output_file = str(default_output)
-            break
-
-        # Добавляем расширение .pdf если его нет
-        if not output_file.lower().endswith('.pdf'):
+        elif not output_file.lower().endswith('.pdf'):
             output_file += '.pdf'
-            print(f"Добавлено расширение .pdf: {output_file}")
 
-        # Проверяем, не перезаписываем ли мы существующий файл
-        if os.path.exists(output_file):
-            overwrite = input(f"Файл '{output_file}' уже существует. Перезаписать? (y/n): ").lower()
-            if overwrite in ['y', 'yes', 'д', 'да']:
-                break
-        else:
-            break
+        # Нормализуем путь
+        output_file = normalize_path(output_file)
 
-    return output_file
-
-
-# ==================== ФУНКЦИИ ИНТЕРФЕЙСА ====================
-
-def show_header():
-    """Показать заголовок программы"""
-    print("\n" + "=" * 60)
-    print("   КОНВЕРТЕР MusicXML В PDF ")
-    print("=" * 60)
-    print("\nКонвертирует нотные записи из MusicXML в формат PDF")
-    print(f"Поддерживаемые форматы: {', '.join(SUPPORTED_EXTENSIONS)}")
-
-
-def show_conversion_progress(input_file, output_file):
-    """Показать информацию о процессе конвертации"""
-    print("\n" + "=" * 60)
-    print("   НАЧАЛО КОНВЕРТАЦИИ")
-    print("=" * 60)
-    print(f"Входной файл: {input_file}")
-    print(f"Выходной файл: {output_file}")
-
-
-def ask_to_open_pdf(output_file):
-    """Спросить, открыть ли PDF файл после конвертации"""
-    if os.path.exists(output_file):
-        open_it = input("\nОткрыть PDF файл? (y/n): ").lower()
-        if open_it in ['y', 'yes', 'д', 'да']:
+        # Проверяем директорию
+        output_dir = os.path.dirname(output_file) or os.getcwd()
+        if not os.path.exists(output_dir):
             try:
-                if sys.platform == 'win32':
-                    os.startfile(output_file)
-                elif sys.platform == 'darwin':
-                    subprocess.run(['open', output_file])
-                else:
-                    subprocess.run(['xdg-open', output_file])
-                print("PDF файл открыт.")
+                os.makedirs(output_dir, exist_ok=True)
+                print(f"Создана директория: {output_dir}")
             except Exception as e:
-                print(f"Не удалось открыть PDF: {e}")
+                print(f"Не удалось создать директорию: {e}")
+                continue
+
+        # Проверка перезаписи
+        if os.path.exists(output_file):
+            overwrite = input(f"Файл '{Path(output_file).name}' уже существует. Перезаписать? (y/n): ").lower()
+            if overwrite not in ['y', 'yes', 'д', 'да']:
+                continue
+
+        return output_file
 
 
-def ask_to_continue():
-    """Спросить, продолжать ли работу"""
-    print("\n" + "-" * 60)
-    again = input("Конвертировать еще один файл? (y/n): ").lower()
-    return again in ['y', 'yes', 'д', 'да']
-
-
-def show_statistics(success_count, total_count):
-    """Показать статистику конвертаций"""
-    print(f"\nСтатистика: {success_count}/{total_count} успешных конвертаций")
-
-
-# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 
 def main():
     """Основная функция программы"""
-    show_header()
 
     # Поиск MuseScore
     print("\nПоиск MuseScore...")
     musescore_path = find_musescore()
 
     if not musescore_path:
-        print("\nMuseScore не найден!")
-        print("Пожалуйста, установите MuseScore с https://musescore.org")
-        print("\nПосле установки:")
-        print("1. Запустите программу снова")
-        print("2. Или укажите путь к MuseScore вручную")
+        print("\n✗ MuseScore не найден!")
+        print("Установите MuseScore с https://musescore.org")
 
-        manual_path = input("\nВведите путь к MuseScore вручную (или Enter для выхода): ").strip()
-        manual_path = manual_path.strip('"').strip("'")
+        # Ручной ввод пути
+        print("\nМожете указать путь к MuseScore вручную:")
+        print("Пример: C:\\Program Files\\MuseScore 4\\bin\\MuseScore4.exe")
 
-        if manual_path and os.path.exists(manual_path):
-            musescore_path = manual_path
-        else:
-            print("\nПрограмма завершена.")
-            return
+        while True:
+            manual_path = input("\nПуть к MuseScore (или Enter для выхода): ").strip()
 
-    print(f"Найден MuseScore: {musescore_path}")
+            if not manual_path:
+                print("Программа завершена.")
+                return
 
-    # Статистика
+            manual_path = normalize_path(manual_path)
+
+            if os.path.exists(manual_path):
+                musescore_path = manual_path
+                break
+            else:
+                print(f"Файл не найден: {manual_path}")
+
+    print(f"\n✓ Найден MuseScore: {musescore_path}")
+
+    # Проверяем MuseScore
+    try:
+        test_result = subprocess.run([musescore_path, "--version"],
+                                     capture_output=True,
+                                     text=True,
+                                     timeout=10,
+                                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        if test_result.returncode == 0:
+            version_info = test_result.stdout.split('\n')[0][:100]
+            print(f"Версия: {version_info}")
+    except:
+        print("⚠ Не удалось проверить версию MuseScore")
+
     success_count = 0
     total_count = 0
 
-    # Главный цикл программы
     while True:
         try:
-            total_count += 1
+            print("\n" + "=" * 60)
 
             # Получение входного файла
             input_file = get_input_file()
-
             if not input_file:
                 print("Файл не выбран.")
                 continue
 
-            # Получение имени выходного файла
+            # Получение выходного файла
             output_file = get_output_filename(input_file)
 
-            # Показ информации о конвертации
-            show_conversion_progress(input_file, output_file)
+            print("\n" + "=" * 60)
+            print("НАЧАЛО КОНВЕРТАЦИИ")
+            print("=" * 60)
 
             # Конвертация
             success = convert_musicxml_to_pdf(input_file, output_file, musescore_path)
 
             if success:
                 success_count += 1
-                print(f"\nКонвертация #{total_count} успешна!")
-
-                # Предложение открыть PDF
-                ask_to_open_pdf(output_file)
+                print(f"\n✓ Конвертация успешна!")
             else:
-                print(f"\nКонвертация #{total_count} не удалась")
+                print(f"\n✗ Конвертация не удалась")
 
-            # Показать статистику
-            show_statistics(success_count, total_count)
+            total_count += 1
 
-            # Спросить о продолжении
-            if not ask_to_continue():
-                print(f"Всего конвертаций: {total_count}, успешно: {success_count}")
+            # Продолжить?
+            print("\n" + "-" * 60)
+            again = input("Конвертировать еще один файл? (y/n): ").lower()
+            if again not in ['y', 'yes', 'д', 'да']:
                 break
 
         except KeyboardInterrupt:
             print("\n\nПрограмма завершена пользователем.")
-            show_statistics(success_count, total_count)
             break
 
         except Exception as e:
-            print(f"\nКритическая ошибка: {e}")
-
-            continue_choice = input("\nПродолжить работу программы? (y/n): ").lower()
+            print(f"\n⚠ Ошибка: {e}")
+            continue_choice = input("Продолжить? (y/n): ").lower()
             if continue_choice not in ['y', 'yes', 'д', 'да']:
-                show_statistics(success_count, total_count)
                 break
 
-
+    # Статистика
+    print("\n" + "=" * 60)
+    print("СТАТИСТИКА")
+    print("=" * 60)
+    print(f"Всего попыток: {total_count}")
+    print(f"Успешно: {success_count}")
+    if total_count > 0:
+        print(f"Процент успеха: {success_count / total_count * 100:.1f}%")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Устанавливаем кодировку для Windows
+        if sys.platform == 'win32':
+            import io
+
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+        main()
+
+    except Exception as e:
+        print(f"\n✗ Критическая ошибка: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    input("\nНажмите Enter для выхода...")
