@@ -11,11 +11,7 @@ class MidiRenderer:
         self.soundfont_path = soundfont_path
         self.sample_rate = sample_rate
 
-    def render(
-        self,
-        midi_path: str,
-        output_wav: str | None = None
-    ) -> np.ndarray:
+    def render(self, midi_path: str, output_wav: str | None = None) -> np.ndarray:
         midi = pretty_midi.PrettyMIDI(midi_path)
         audio = midi.fluidsynth(
             fs=self.sample_rate,
