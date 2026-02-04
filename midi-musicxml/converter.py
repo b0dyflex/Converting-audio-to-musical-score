@@ -19,7 +19,6 @@ class MidiToMusicXMLConverter:
                 raise ValueError("No such file")
             if not self.is_midi_file(input_path):
                 raise ValueError(f"Unsupported file extension, support only {self.midi_extensions}")
-            output_path = 'ready.musicxml'
             score = self.parse(input_path)
             enchanced_score = ScoringEnchancer.enhance_score(score)
             print(f"output_path: {self.export_music_xml(output_path, enchanced_score)}")
@@ -48,13 +47,12 @@ class MidiToMusicXMLConverter:
         """Пакетная конвертация всех MIDI файлов в директории."""
         try:
             if not os.path.exists(input_dir):
-                print(f'No such directory: {input_dir}, creating...')
-                os.makedirs(input_dir)
+                print(f'No such directory: {input_dir}')
+                return None
             if output_dir and not os.path.exists(output_dir):
                 print('No output_directory, creating...')
                 os.makedirs(output_dir)
             midi_files = []
-            print(midi_file, 'govno')
             for root, _, files in os.walk(input_dir):
                 for file in files:
                     filepath = os.path.join(root, file)

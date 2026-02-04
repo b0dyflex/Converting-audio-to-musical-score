@@ -2,15 +2,16 @@ import os
 import sys
 import argparse
 from converter import MidiToMusicXMLConverter
+import logging
 
 
 def interactive_mode():
-    """
-    Интерактивный режим работы программы
-    """
-    print("\n" + "=" * 60)
+    """Интерактивный режим работы программы."""
     choice = input(
-        "Выберите режим работы:\n1. Конвертация одного файла\n2. Пакетная конвертация\n\nВаш выбор (1/2): ").strip()
+        "Выберите режим работы:\n" \
+        "1. Конвертация одного файла\n" \
+        "2. Пакетная конвертация\n" \
+        "\nВаш выбор (1/2): ").strip()
 
     if choice == '1':
         input_file = input("Введите путь к MIDI файлу: ").strip('"\' ')
@@ -24,6 +25,7 @@ def interactive_mode():
         if not directory:
             print("Не указана директория")
             return None
+        return {'directory': directory}
     else:
         print("Неверный выбор")
         return None
@@ -143,27 +145,21 @@ def main():
 
     # Выполняем конвертацию
     if args.input_file:
-        print("=" * 60)
-        print("КОНВЕРТАЦИЯ MIDI В MUSICXML")
-        print("=" * 60)
-
-        result = converter.convert_file(args.input_file, args.output)
+        logging.info('midi to music xml converting')
+        result = converter.convert_file(
+            input_path=args.input_file,
+            output_path=args.output,
+        )
+        print(result)
 
         if result:
-            print("\n" + "=" * 60)
-            print("КОНВЕРТАЦИЯ ЗАВЕРШЕНА!")
-            print("=" * 60)
-
+            logging.info('Converting complete')
             show_file_preview(result)
-
             open_result_directory(result)
 
     elif args.directory:
-        print("=" * 60)
-        print("ПАКЕТНАЯ КОНВЕРТАЦИЯ MIDI В MUSICXML")
-        print("=" * 60)
-
-        converter.convert_batch(args.directory, r'C:/Users/papak/Converting-audio-to-musical-score/musicxml/')
+        logging.info('midi to music xml batch converting')
+        converter.convert_batch(args.directory)
 
 
 if __name__ == "__main__":
