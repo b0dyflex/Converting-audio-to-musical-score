@@ -1,7 +1,3 @@
-"""
-note_analyzer.py - Модуль для анализа музыкальных нот и интервалов
-"""
-
 import hashlib
 from typing import List, Dict, Any, Optional, Tuple
 from music21 import note, interval, pitch, chord, dynamics
