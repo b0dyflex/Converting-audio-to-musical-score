@@ -15,56 +15,6 @@ from note_analyzer import NoteAnalyzer
 from decimal import Decimal
 from fractions import Fraction
 
-
-class MusicTransformer(nn.Module):
-    def __init__(self, vocab_size, feature_dim, n_layers, n_heads):
-        super().__init__()
-
-        # Эмбеддинги для токенов нот
-        self.note_embedding = nn.Embedding(vocab_size, 512)
-
-        # Эмбеддинги для признаков
-        self.feature_embeddings = nn.ModuleDict({
-            'pitch': nn.Embedding(128, 64),  # 128 MIDI нот
-            'duration': nn.Linear(1, 32),  # Нормализованная длительность
-            'articulation': nn.Embedding(10, 32),  # Типы артикуляции
-            'dynamics': nn.Embedding(8, 32),  # Уровни динамики
-        })
-
-        # Позиционные эмбеддинги для временных позиций
-        self.position_embedding = nn.Embedding(1000, 512)
-
-        # Трансформер
-        self.transformer = nn.Transformer(
-            d_model=512,
-            nhead=n_heads,
-            num_encoder_layers=n_layers,
-            num_decoder_layers=n_layers
-        )
-
-        # Выходные слои
-        self.note_head = nn.Linear(512, vocab_size)
-        self.feature_heads = nn.ModuleDict({
-            'duration': nn.Linear(512, 1),
-            'dynamics': nn.Linear(512, 8)
-        })
-
-    def forward(self, note_tokens, features, positional_ids):
-        # Комбинированные эмбеддинги
-        note_emb = self.note_embedding(note_tokens)
-        feature_emb = self._combine_features(features)
-        pos_emb = self.position_embedding(positional_ids)
-
-        combined = note_emb + feature_emb + pos_emb
-
-        # Через трансформер
-        output = self.transformer(combined, combined)
-
-        # Предсказания
-        note_predictions = self.note_head(output)
-        duration_predictions = self.feature_heads['duration'](output)
-
-        return note_predictions, duration_predictions
 class MusicJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, Fraction):
