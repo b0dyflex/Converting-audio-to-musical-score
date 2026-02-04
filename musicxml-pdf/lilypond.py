@@ -3,7 +3,7 @@ import sys
 import subprocess
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
-from music21 import converter, environment, metadata, stream, meter, key, tempo, chord, harmony, dynamics, instrument
+from music21 import converter, environment, metadata, stream, meter, key, tempo, chord, harmony, dynamics, instrument, note, interval, pitch, scale, analysis
 from music21.stream.base import Score
 import argparse
 import traceback
@@ -11,7 +11,82 @@ import time
 import json
 from datetime import datetime
 import statistics
+from note_analyzer import NoteAnalyzer
+from decimal import Decimal
+from fractions import Fraction
 
+
+class MusicTransformer(nn.Module):
+    def __init__(self, vocab_size, feature_dim, n_layers, n_heads):
+        super().__init__()
+
+        # Эмбеддинги для токенов нот
+        self.note_embedding = nn.Embedding(vocab_size, 512)
+
+        # Эмбеддинги для признаков
+        self.feature_embeddings = nn.ModuleDict({
+            'pitch': nn.Embedding(128, 64),  # 128 MIDI нот
+            'duration': nn.Linear(1, 32),  # Нормализованная длительность
+            'articulation': nn.Embedding(10, 32),  # Типы артикуляции
+            'dynamics': nn.Embedding(8, 32),  # Уровни динамики
+        })
+
+        # Позиционные эмбеддинги для временных позиций
+        self.position_embedding = nn.Embedding(1000, 512)
+
+        # Трансформер
+        self.transformer = nn.Transformer(
+            d_model=512,
+            nhead=n_heads,
+            num_encoder_layers=n_layers,
+            num_decoder_layers=n_layers
+        )
+
+        # Выходные слои
+        self.note_head = nn.Linear(512, vocab_size)
+        self.feature_heads = nn.ModuleDict({
+            'duration': nn.Linear(512, 1),
+            'dynamics': nn.Linear(512, 8)
+        })
+
+    def forward(self, note_tokens, features, positional_ids):
+        # Комбинированные эмбеддинги
+        note_emb = self.note_embedding(note_tokens)
+        feature_emb = self._combine_features(features)
+        pos_emb = self.position_embedding(positional_ids)
+
+        combined = note_emb + feature_emb + pos_emb
+
+        # Через трансформер
+        output = self.transformer(combined, combined)
+
+        # Предсказания
+        note_predictions = self.note_head(output)
+        duration_predictions = self.feature_heads['duration'](output)
+
+        return note_predictions, duration_predictions
+class MusicJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Fraction):
+            return {
+                '__type__': 'Fraction',
+                'numerator': obj.numerator,
+                'denominator': obj.denominator,
+                'value': float(obj)
+            }
+        elif isinstance(obj, Decimal):
+            return float(obj)
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif hasattr(obj, '__dict__'):
+            # Для объектов с атрибутами
+            return {k: v for k, v in obj.__dict__.items()
+                    if not k.startswith('_')}
+        elif isinstance(obj, (set, tuple)):
+            return list(obj)
+        elif hasattr(obj, '__str__'):
+            return str(obj)
+        return super().default(obj)
 
 class MusicXMLtoPDFConverter:
     DEFAULT_LILYPOND_PATH = r"C:\Program Files\LilyPond\bin\lilypond.exe"
@@ -113,7 +188,890 @@ class MusicXMLtoPDFConverter:
                 unique_paths.append(path)
         return unique_paths
 
+    def get_note_range_overlap(self, score: Score, start_measure: int = 1, end_measure: int = None) -> List[
+        Dict[str, Any]]:
+        """
+        Возвращает интервал нот в указанном диапазоне с нахлестом (overlap).
 
+        Args:
+            score: Music21 Score объект
+            start_measure: начальный такт (1-based)
+            end_measure: конечный такт (None = до конца)
+
+        Returns:
+            Список словарей с характеристиками нот и их токенами
+        """
+        notes_info = []
+
+        try:
+            for i, part in enumerate(score.parts):
+                part_name = getattr(part, 'partName', f'Part {i + 1}')
+
+                # Получаем такты
+                measures = list(part.getElementsByClass('Measure'))
+
+                if not measures:
+                    continue
+
+                # Определяем конечный такт
+                if end_measure is None:
+                    end_measure = len(measures)
+                else:
+                    end_measure = min(end_measure, len(measures))
+
+                # Собираем ноты из указанного диапазона
+                for measure_idx in range(max(0, start_measure - 1), end_measure):
+                    measure = measures[measure_idx]
+                    measure_num = measure_idx + 1
+
+                    # Получаем все ноты в такте
+                    measure_notes = list(measure.notes)
+
+                    for j, n in enumerate(measure_notes):
+                        try:
+                            note_info = {
+                                'part': part_name,
+                                'measure': measure_num,
+                                'position_in_measure': j,
+                                'note_object': n,
+                                'token': self._create_note_token(n),
+                                'characteristics': self._get_note_characteristics(n),
+                                'overlap_info': self._get_overlap_info(n, measure_notes, j)
+                            }
+                            notes_info.append(note_info)
+                        except Exception as e:
+                            print(f"Ошибка обработки ноты: {e}")
+                            continue
+
+            # Добавляем информацию о связях между нотами
+            self._add_note_relations(notes_info)
+
+        except Exception as e:
+            print(f"Ошибка при получении диапазона нот: {e}")
+
+        return notes_info
+
+    def _create_note_token(self, note_obj: note.Note) -> str:
+        """
+        Создает уникальный токен для ноты.
+
+        Формат: P{part_id}M{measure}N{note_index}_{pitch}_{duration}_{articulations}
+        """
+        try:
+            # Базовые характеристики
+            if hasattr(note_obj, 'pitch'):
+                pitch_str = str(note_obj.pitch)
+            else:
+                pitch_str = 'unknown'
+
+            if hasattr(note_obj, 'duration'):
+                duration = note_obj.duration.quarterLength
+                duration_str = f"D{duration}"
+            else:
+                duration_str = "D0"
+
+            # Артикуляция
+            articulations = []
+            if hasattr(note_obj, 'articulations'):
+                for art in note_obj.articulations:
+                    articulations.append(str(art))
+
+            articulation_str = "_".join(articulations) if articulations else "no_articulation"
+
+            # Динамика
+            dynamics = []
+            if hasattr(note_obj, 'expressions'):
+                for expr in note_obj.expressions:
+                    if isinstance(expr, dynamics.Dynamic):
+                        dynamics.append(str(expr))
+
+            dynamic_str = "_".join(dynamics) if dynamics else "no_dynamic"
+
+            # Создаем токен
+            token = f"{pitch_str}_{duration_str}_{articulation_str}_{dynamic_str}"
+
+            # Хешируем для уникальности
+            import hashlib
+            token_hash = hashlib.md5(token.encode()).hexdigest()[:8]
+
+            return f"NOTE_{token_hash}"
+
+        except Exception as e:
+            return f"ERROR_{hash(str(e)) % 10000}"
+
+    def _get_note_characteristics(self, note_obj: note.Note) -> Dict[str, Any]:
+        """Возвращает характеристики ноты."""
+        characteristics = {
+            'basic': {},
+            'pitch_info': {},
+            'rhythmic_info': {},
+            'performance_info': {},
+            'contextual_info': {}
+        }
+
+        try:
+            # Базовые характеристики
+            characteristics['basic'] = {
+                'type': note_obj.className,
+                'is_rest': isinstance(note_obj, note.Rest),
+                'is_chord': isinstance(note_obj, chord.Chord)
+            }
+
+            # Информация о высоте звука
+            if hasattr(note_obj, 'pitch'):
+                p = note_obj.pitch
+                characteristics['pitch_info'] = {
+                    'name': p.name,
+                    'name_with_octave': p.nameWithOctave,
+                    'midi_number': p.midi,
+                    'frequency': round(p.frequency, 2) if hasattr(p, 'frequency') else None,
+                    'octave': p.octave,
+                    'step': p.step,
+                    'accidental': str(p.accidental) if p.accidental else None,
+                    'is_microtone': p.isMicrotonal(),
+                    'spelling': self._get_pitch_spelling(p)
+                }
+
+            # Ритмическая информация
+            if hasattr(note_obj, 'duration'):
+                d = note_obj.duration
+                characteristics['rhythmic_info'] = {
+                    'quarter_length': d.quarterLength,
+                    'type': d.type,
+                    'dots': d.dots,
+                    'tuplets': [str(t) for t in d.tuplets] if hasattr(d, 'tuplets') else [],
+                    'is_grace': d.isGrace,
+                    'is_incomplete': d.incompleteFill,
+                    'duration_components': self._get_duration_components(d)
+                }
+
+            # Исполнительская информация
+            characteristics['performance_info'] = {
+                'articulations': [str(a) for a in note_obj.articulations] if hasattr(note_obj, 'articulations') else [],
+                'expressions': [str(e) for e in note_obj.expressions] if hasattr(note_obj, 'expressions') else [],
+                'lyrics': [str(l.text) for l in note_obj.lyrics] if hasattr(note_obj, 'lyrics') else [],
+                'tie': str(note_obj.tie) if hasattr(note_obj, 'tie') else None,
+                'stem_direction': note_obj.stemDirection if hasattr(note_obj, 'stemDirection') else None
+            }
+
+            # Контекстная информация
+            if hasattr(note_obj, 'volume'):
+                characteristics['performance_info']['volume'] = {
+                    'velocity': note_obj.volume.velocity,
+                    'velocity_is_relative': note_obj.volume.velocityIsRelative
+                }
+
+            # Теоретическая информация
+            characteristics['theoretical_info'] = {
+                'scale_degree': self._get_scale_degree(note_obj),
+                'harmonic_function': self._estimate_harmonic_function(note_obj),
+                'melodic_contour': self._get_melodic_contour(note_obj)
+            }
+
+        except Exception as e:
+            characteristics['error'] = str(e)
+
+        return characteristics
+
+    def _get_overlap_info(self, current_note: note.Note, measure_notes: List, position: int) -> Dict[str, Any]:
+        """
+        Анализирует нахлест ноты с соседними нотами.
+
+        Returns:
+            Информация о перекрытии с предыдущими и последующими нотами
+        """
+        overlap_info = {
+            'previous_overlap': None,
+            'next_overlap': None,
+            'simultaneous_notes': []
+        }
+
+        try:
+            # Проверяем перекрытие с предыдущей нотой
+            if position > 0:
+                prev_note = measure_notes[position - 1]
+                if self._notes_overlap(prev_note, current_note):
+                    overlap_info['previous_overlap'] = {
+                        'note': str(prev_note),
+                        'overlap_type': self._determine_overlap_type(prev_note, current_note),
+                        'overlap_ratio': self._calculate_overlap_ratio(prev_note, current_note)
+                    }
+
+            # Проверяем перекрытие со следующей нотой
+            if position < len(measure_notes) - 1:
+                next_note = measure_notes[position + 1]
+                if self._notes_overlap(current_note, next_note):
+                    overlap_info['next_overlap'] = {
+                        'note': str(next_note),
+                        'overlap_type': self._determine_overlap_type(current_note, next_note),
+                        'overlap_ratio': self._calculate_overlap_ratio(current_note, next_note)
+                    }
+
+            # Находим ноты, звучащие одновременно
+            if position > 0:
+                # Проверяем все предыдущие ноты на одновременное звучание
+                for i in range(position):
+                    other_note = measure_notes[i]
+                    if self._notes_simultaneous(other_note, current_note):
+                        overlap_info['simultaneous_notes'].append({
+                            'note': str(other_note),
+                            'position': i,
+                            'interval': self._get_interval_between_notes(other_note, current_note)
+                        })
+
+        except Exception as e:
+            overlap_info['error'] = str(e)
+
+        return overlap_info
+
+    def _notes_overlap(self, note1: note.Note, note2: note.Note) -> bool:
+        """Проверяет, перекрываются ли ноты во времени."""
+        try:
+            if not hasattr(note1, 'offset') or not hasattr(note2, 'offset'):
+                return False
+
+            if not hasattr(note1, 'duration') or not hasattr(note2, 'duration'):
+                return False
+
+            end1 = note1.offset + note1.duration.quarterLength
+            start2 = note2.offset
+
+            return end1 > start2
+
+        except:
+            return False
+
+    def _notes_simultaneous(self, note1: note.Note, note2: note.Note) -> bool:
+        """Проверяет, звучат ли ноты одновременно."""
+        try:
+            if not hasattr(note1, 'offset') or not hasattr(note2, 'offset'):
+                return False
+
+            start1 = note1.offset
+            start2 = note2.offset
+
+            # Считаем ноты одновременными, если их начала совпадают
+            return abs(start1 - start2) < 0.01
+
+        except:
+            return False
+
+    def _determine_overlap_type(self, note1: note.Note, note2: note.Note) -> str:
+        """Определяет тип перекрытия нот."""
+        try:
+            if not self._notes_overlap(note1, note2):
+                return "no_overlap"
+
+            end1 = note1.offset + note1.duration.quarterLength
+            start2 = note2.offset
+
+            overlap_amount = end1 - start2
+
+            # Процент перекрытия относительно длительности первой ноты
+            if hasattr(note1, 'duration'):
+                overlap_percentage = overlap_amount / note1.duration.quarterLength
+
+                if overlap_percentage < 0.1:
+                    return "slight_overlap"
+                elif overlap_percentage < 0.3:
+                    return "moderate_overlap"
+                elif overlap_percentage < 0.7:
+                    return "significant_overlap"
+                else:
+                    return "heavy_overlap"
+
+            return "overlap"
+
+        except:
+            return "unknown"
+
+    def _calculate_overlap_ratio(self, note1: note.Note, note2: note.Note) -> float:
+        """Вычисляет коэффициент перекрытия."""
+        try:
+            if not self._notes_overlap(note1, note2):
+                return 0.0
+
+            end1 = note1.offset + note1.duration.quarterLength
+            start2 = note2.offset
+
+            overlap_amount = end1 - start2
+
+            # Коэффициент относительно более короткой ноты
+            duration1 = note1.duration.quarterLength
+            duration2 = note2.duration.quarterLength
+
+            return overlap_amount / min(duration1, duration2)
+
+        except:
+            return 0.0
+
+    def _get_interval_between_notes(self, note1: note.Note, note2: note.Note) -> Dict[str, Any]:
+        """Возвращает интервал между двумя нотами."""
+        interval_info = {
+            'simple_name': None,
+            'compound_name': None,
+            'semitones': None,
+            'direction': None,
+            'diatonic': None,
+            'chromatic': None
+        }
+
+        try:
+            if hasattr(note1, 'pitch') and hasattr(note2, 'pitch'):
+                intv = interval.Interval(noteStart=note1.pitch, noteEnd=note2.pitch)
+
+                interval_info['simple_name'] = intv.simpleName
+                interval_info['compound_name'] = intv.name
+                interval_info['semitones'] = intv.semitones
+                interval_info['direction'] = intv.direction.name if hasattr(intv.direction, 'name') else str(
+                    intv.direction)
+                interval_info['diatonic'] = intv.diatonic.name if hasattr(intv.diatonic, 'name') else str(intv.diatonic)
+                interval_info['chromatic'] = intv.chromatic.name if hasattr(intv.chromatic, 'name') else str(
+                    intv.chromatic)
+
+                # Дополнительная информация
+                interval_info['is_consonant'] = intv.isConsonant()
+                interval_info['is_dissonant'] = intv.isDissonant()
+                interval_info['is_perfect'] = intv.isPerfectType
+                interval_info['generic'] = intv.generic.simpleUndirected
+
+        except Exception as e:
+            interval_info['error'] = str(e)
+
+        return interval_info
+
+    def _add_note_relations(self, notes_info: List[Dict[str, Any]]) -> None:
+        """Добавляет информацию о связях между нотами."""
+        for i in range(len(notes_info)):
+            current_note = notes_info[i]
+
+            # Связь с предыдущей нотой
+            if i > 0:
+                prev_note = notes_info[i - 1]
+                current_note['relations'] = current_note.get('relations', {})
+                current_note['relations']['previous'] = {
+                    'token': prev_note['token'],
+                    'interval': self._get_interval_between_notes(
+                        prev_note['note_object'],
+                        current_note['note_object']
+                    ) if hasattr(prev_note['note_object'], 'pitch') else None,
+                    'time_gap': self._calculate_time_gap(
+                        prev_note['note_object'],
+                        current_note['note_object']
+                    )
+                }
+
+            # Связь со следующей нотой
+            if i < len(notes_info) - 1:
+                next_note = notes_info[i + 1]
+                current_note['relations'] = current_note.get('relations', {})
+                current_note['relations']['next'] = {
+                    'token': next_note['token'],
+                    'interval': self._get_interval_between_notes(
+                        current_note['note_object'],
+                        next_note['note_object']
+                    ) if hasattr(current_note['note_object'], 'pitch') else None
+                }
+
+    def _calculate_time_gap(self, note1: note.Note, note2: note.Note) -> float:
+        """Вычисляет временной промежуток между нотами."""
+        try:
+            if hasattr(note1, 'offset') and hasattr(note2, 'offset'):
+                end1 = note1.offset + note1.duration.quarterLength
+                start2 = note2.offset
+
+                return max(0, start2 - end1)
+        except:
+            pass
+        return 0.0
+
+    def _get_pitch_spelling(self, pitch_obj: pitch.Pitch) -> Dict[str, Any]:
+        """Возвращает информацию о написании высоты звука."""
+        spelling = {
+            'enharmonic_spellings': [],
+            'preferred_spelling': None,
+            'spelling_ambiguity': False
+        }
+
+        try:
+            # Получаем альтернативные написания
+            enharmonics = pitch_obj.getAllCommonEnharmonics()
+            spelling['enharmonic_spellings'] = [str(p) for p in enharmonics]
+
+            # Предпочтительное написание
+            spelling['preferred_spelling'] = pitch_obj.nameWithOctave
+
+            # Проверяем на неоднозначность
+            spelling['spelling_ambiguity'] = len(enharmonics) > 1
+
+        except:
+            pass
+
+        return spelling
+
+    def _get_duration_components(self, duration_obj) -> List[Dict[str, Any]]:
+        """Разбивает длительность на компоненты."""
+        components = []
+
+        try:
+            # Для тюплетов
+            if hasattr(duration_obj, 'tuplets') and duration_obj.tuplets:
+                for tuplet in duration_obj.tuplets:
+                    components.append({
+                        'type': 'tuplet',
+                        'ratio': str(tuplet.tupletRatio()),
+                        'number_notes': tuplet.numberNotesActual,
+                        'duration_notes': tuplet.numberNotesNormal
+                    })
+
+            # Основная длительность
+            components.append({
+                'type': 'base',
+                'duration': duration_obj.quarterLength,
+                'type_name': duration_obj.type,
+                'dots': duration_obj.dots,
+                'is_grace': duration_obj.isGrace
+            })
+
+        except:
+            pass
+
+        return components
+
+    def _get_scale_degree(self, note_obj: note.Note) -> Optional[int]:
+        """Определяет ступень лада для ноты."""
+        try:
+            if hasattr(note_obj, 'pitch'):
+                # Это упрощенная версия - в реальности нужен анализ лада
+                p = note_obj.pitch
+                midi_num = p.midi
+
+                # Простая эвристика для мажора
+                scale_notes = [0, 2, 4, 5, 7, 9, 11]  # Мажорный лад
+
+                degree = (midi_num % 12)
+                if degree in scale_notes:
+                    return scale_notes.index(degree) + 1
+        except:
+            pass
+
+        return None
+
+    def _estimate_harmonic_function(self, note_obj: note.Note) -> str:
+        """Оценивает гармоническую функцию ноты."""
+        # Упрощенная версия
+        return "undefined"
+
+    def _get_melodic_contour(self, note_obj: note.Note) -> str:
+        """Определяет мелодический контур."""
+        # Упрощенная версия
+        return "stable"
+
+    def get_note_subset_by_criteria(self, notes_info: List[Dict[str, Any]],
+                                    criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Возвращает подмножество нот по заданным критериям.
+
+        Args:
+            notes_info: Список информации о нотах
+            criteria: Словарь с критериями фильтрации
+
+        Available criteria:
+            - pitch_range: {'min': midi_min, 'max': midi_max}
+            - duration_range: {'min': min_duration, 'max': max_duration}
+            - articulation_types: ['staccato', 'tenuto', ...]
+            - dynamic_levels: ['p', 'mp', 'mf', 'f', ...]
+            - overlap_type: ['slight_overlap', 'moderate_overlap', ...]
+            - scale_degree: [1, 3, 5, ...]
+            - measure_range: {'start': measure_start, 'end': measure_end}
+        """
+        filtered_notes = []
+
+        for note_info in notes_info:
+            if self._meets_criteria(note_info, criteria):
+                filtered_notes.append(note_info)
+
+        return filtered_notes
+
+    def _meets_criteria(self, note_info: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+        """Проверяет, удовлетворяет ли нота критериям."""
+        try:
+            # Проверка диапазона высоты
+            if 'pitch_range' in criteria:
+                pitch_info = note_info['characteristics'].get('pitch_info', {})
+                midi_num = pitch_info.get('midi_number')
+                if midi_num is None:
+                    return False
+
+                pitch_range = criteria['pitch_range']
+                if not (pitch_range.get('min', 0) <= midi_num <= pitch_range.get('max', 127)):
+                    return False
+
+            # Проверка диапазона длительности
+            if 'duration_range' in criteria:
+                rhythmic_info = note_info['characteristics'].get('rhythmic_info', {})
+                duration = rhythmic_info.get('quarter_length')
+                if duration is None:
+                    return False
+
+                dur_range = criteria['duration_range']
+                if not (dur_range.get('min', 0) <= duration <= dur_range.get('max', float('inf'))):
+                    return False
+
+            # Проверка артикуляции
+            if 'articulation_types' in criteria:
+                perf_info = note_info['characteristics'].get('performance_info', {})
+                articulations = perf_info.get('articulations', [])
+                required_articulations = criteria['articulation_types']
+
+                if required_articulations:
+                    has_required = any(art.lower() in [a.lower() for a in articulations]
+                                       for art in required_articulations)
+                    if not has_required:
+                        return False
+
+            # Проверка динамики
+            if 'dynamic_levels' in criteria:
+                perf_info = note_info['characteristics'].get('performance_info', {})
+                expressions = perf_info.get('expressions', [])
+                required_dynamics = criteria['dynamic_levels']
+
+                if required_dynamics:
+                    has_required = any(dyn.lower() in [e.lower() for e in expressions]
+                                       for dyn in required_dynamics)
+                    if not has_required:
+                        return False
+
+            # Проверка типа перекрытия
+            if 'overlap_type' in criteria:
+                overlap_type = note_info.get('overlap_info', {}).get('previous_overlap', {}).get('overlap_type')
+                if overlap_type not in criteria['overlap_type']:
+                    return False
+
+            # Проверка ступени лада
+            if 'scale_degree' in criteria:
+                theoretical_info = note_info['characteristics'].get('theoretical_info', {})
+                degree = theoretical_info.get('scale_degree')
+                if degree not in criteria['scale_degree']:
+                    return False
+
+            # Проверка диапазона тактов
+            if 'measure_range' in criteria:
+                measure = note_info.get('measure')
+                measure_range = criteria['measure_range']
+                if not (measure_range.get('start', 1) <= measure <= measure_range.get('end', float('inf'))):
+                    return False
+
+            return True
+
+        except Exception as e:
+            print(f"Ошибка при проверке критериев: {e}")
+            return False
+
+    def analyze_note_patterns(self, notes_info: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Анализирует паттерны в последовательности нот.
+
+        Returns:
+            Словарь с обнаруженными паттернами
+        """
+        patterns = {
+            'repetitions': [],
+            'sequences': [],
+            'intervallic_patterns': [],
+            'rhythmic_patterns': [],
+            'contour_patterns': []
+        }
+
+        try:
+            # Поиск повторяющихся последовательностей
+            patterns['repetitions'] = self._find_repetitions(notes_info)
+
+            # Поиск секвенций
+            patterns['sequences'] = self._find_sequences(notes_info)
+
+            # Анализ интервальных паттернов
+            patterns['intervallic_patterns'] = self._analyze_intervallic_patterns(notes_info)
+
+            # Анализ ритмических паттернов
+            patterns['rhythmic_patterns'] = self._analyze_rhythmic_patterns(notes_info)
+
+            # Анализ мелодического контура
+            patterns['contour_patterns'] = self._analyze_contour_patterns(notes_info)
+
+        except Exception as e:
+            patterns['error'] = str(e)
+
+        return patterns
+
+    def _find_repetitions(self, notes_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Находит повторяющиеся последовательности нот."""
+        repetitions = []
+
+        try:
+            # Извлекаем последовательности токенов
+            tokens = [note['token'] for note in notes_info]
+
+            # Ищем повторения длиной от 2 до 6 нот
+            for length in range(2, min(7, len(tokens) // 2 + 1)):
+                for i in range(len(tokens) - length):
+                    sequence = tokens[i:i + length]
+
+                    # Ищем такую же последовательность дальше
+                    for j in range(i + length, len(tokens) - length + 1):
+                        if tokens[j:j + length] == sequence:
+                            repetition = {
+                                'sequence': sequence,
+                                'positions': [i, j],
+                                'length': length,
+                                'notes': [
+                                    {
+                                        'token': notes_info[k]['token'],
+                                        'characteristics': notes_info[k]['characteristics']
+                                    }
+                                    for k in range(i, i + length)
+                                ]
+                            }
+                            repetitions.append(repetition)
+
+        except Exception as e:
+            print(f"Ошибка при поиске повторений: {e}")
+
+        return repetitions
+
+    def export_note_analysis(self, notes_info: List[Dict[str, Any]],
+                             output_path: str) -> None:
+        """
+        Экспортирует анализ нот в JSON файл.
+
+        Args:
+            notes_info: Список информации о нотах
+            output_path: Путь для сохранения файла
+        """
+        try:
+            # Подготавливаем данные для экспорта
+            export_data = {
+                'metadata': {
+                    'total_notes': len(notes_info),
+                    'export_date': datetime.now().isoformat(),
+                    'analysis_version': '1.0'
+                },
+                'notes': [],
+                'summary': self._create_note_summary(notes_info),
+                'patterns': self.analyze_note_patterns(notes_info)
+            }
+
+            # Добавляем информацию о нотах (упрощаем для экспорта)
+            for note_info in notes_info:
+                simplified_note = {
+                    'token': note_info['token'],
+                    'measure': note_info['measure'],
+                    'position_in_measure': note_info['position_in_measure'],
+                    'part': note_info['part'],
+                    'pitch': note_info['characteristics'].get('pitch_info', {}).get('name_with_octave'),
+                    'midi_number': note_info['characteristics'].get('pitch_info', {}).get('midi_number'),
+                    'duration': note_info['characteristics'].get('rhythmic_info', {}).get('quarter_length'),
+                    'articulations': note_info['characteristics'].get('performance_info', {}).get('articulations', []),
+                    'overlap_type': note_info.get('overlap_info', {}).get('previous_overlap', {}).get('overlap_type'),
+                    'relations': note_info.get('relations', {})
+                }
+                export_data['notes'].append(simplified_note)
+
+            # Сохраняем в JSON
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
+
+            print(f"✓ Анализ нот экспортирован: {output_path}")
+
+        except Exception as e:
+            print(f"Ошибка при экспорте анализа нот: {e}")
+
+    def _create_note_summary(self, notes_info: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Создает сводку по анализу нот."""
+        summary = {
+            'pitch_statistics': {
+                'range': {'min': 127, 'max': 0},
+                'average': 0,
+                'common_pitches': []
+            },
+            'duration_statistics': {
+                'range': {'min': float('inf'), 'max': 0},
+                'average': 0,
+                'duration_distribution': {}
+            },
+            'articulation_statistics': {},
+            'overlap_statistics': {}
+        }
+
+        try:
+            # Статистика по высотам
+            midi_numbers = []
+            pitch_counts = {}
+
+            # Статистика по длительностям
+            durations = []
+            duration_counts = {}
+
+            # Статистика по артикуляции
+            articulation_counts = {}
+
+            # Статистика по перекрытию
+            overlap_counts = {}
+
+            for note_info in notes_info:
+                # Высота
+                pitch_info = note_info['characteristics'].get('pitch_info', {})
+                midi_num = pitch_info.get('midi_number')
+                if midi_num is not None:
+                    midi_numbers.append(midi_num)
+
+                    pitch_name = pitch_info.get('name')
+                    if pitch_name:
+                        pitch_counts[pitch_name] = pitch_counts.get(pitch_name, 0) + 1
+
+                # Длительность
+                rhythmic_info = note_info['characteristics'].get('rhythmic_info', {})
+                duration = rhythmic_info.get('quarter_length')
+                if duration is not None:
+                    durations.append(duration)
+
+                    # Группируем по типам длительностей
+                    dur_type = rhythmic_info.get('type', 'unknown')
+                    duration_counts[dur_type] = duration_counts.get(dur_type, 0) + 1
+
+                # Артикуляции
+                perf_info = note_info['characteristics'].get('performance_info', {})
+                for articulation in perf_info.get('articulations', []):
+                    articulation_counts[articulation] = articulation_counts.get(articulation, 0) + 1
+
+                # Перекрытие
+                overlap_type = note_info.get('overlap_info', {}).get('previous_overlap', {}).get('overlap_type')
+                if overlap_type:
+                    overlap_counts[overlap_type] = overlap_counts.get(overlap_type, 0) + 1
+
+            # Заполняем сводку
+            if midi_numbers:
+                summary['pitch_statistics']['range']['min'] = min(midi_numbers)
+                summary['pitch_statistics']['range']['max'] = max(midi_numbers)
+                summary['pitch_statistics']['average'] = sum(midi_numbers) / len(midi_numbers)
+
+                # Самые частые высоты
+                sorted_pitches = sorted(pitch_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+                summary['pitch_statistics']['common_pitches'] = sorted_pitches
+
+            if durations:
+                summary['duration_statistics']['range']['min'] = min(durations)
+                summary['duration_statistics']['range']['max'] = max(durations)
+                summary['duration_statistics']['average'] = sum(durations) / len(durations)
+                summary['duration_statistics']['duration_distribution'] = duration_counts
+
+            summary['articulation_statistics'] = articulation_counts
+            summary['overlap_statistics'] = overlap_counts
+
+        except Exception as e:
+            summary['error'] = str(e)
+
+        return summary
+
+    # Внутри класса можно добавить следующий метод для демонстрации:
+
+    def demonstrate_note_analysis(self, score: Score):
+        """Демонстрация нового функционала анализа нот."""
+
+        notes_in_range = self.get_note_range_overlap(score, start_measure=1, end_measure=10)
+
+        print(f"Найдено нот в диапазоне: {len(notes_in_range)}")
+
+        criteria = {
+            'pitch_range': {'min': 60, 'max': 72},  # От C4 до C5
+            'duration_range': {'min': 0.5, 'max': 2.0},
+            'articulation_types': ['staccato', 'accent']
+        }
+
+        filtered_notes = self.get_note_subset_by_criteria(notes_in_range, criteria)
+        print(f"Нот по критериям: {len(filtered_notes)}")
+
+        patterns = self.analyze_note_patterns(notes_in_range)
+        print(f"Найдено паттернов: {len(patterns.get('repetitions', []))} повторений")
+
+        self.export_note_analysis(notes_in_range, "note_analysis.json")
+
+        if notes_in_range:
+            sample_note = notes_in_range[0]
+            print(f"\nПример ноты:")
+            print(f"  Токен: {sample_note['token']}")
+            print(f"  Такт: {sample_note['measure']}")
+            print(f"  Высота: {sample_note['characteristics']['pitch_info']['name_with_octave']}")
+            print(f"  Длительность: {sample_note['characteristics']['rhythmic_info']['quarter_length']}")
+
+            if sample_note['overlap_info']['previous_overlap']:
+                print(f"  Перекрытие: {sample_note['overlap_info']['previous_overlap']['overlap_type']}")
+
+        return {
+            'total_notes': len(notes_in_range),
+            'filtered_notes': len(filtered_notes),
+            'patterns_found': sum(len(v) for v in patterns.values() if isinstance(v, list))
+        }
+
+    def analyze_notes_in_range(self, input_path: str, start_measure: int = 1,
+                               end_measure: Optional[int] = None,
+                               part_index: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Анализирует ноты в указанном диапазоне и возвращает результаты.
+
+        Args:
+            input_path: путь к MusicXML файлу
+            start_measure: начальный такт
+            end_measure: конечный такт
+            part_index: индекс партии
+
+        Returns:
+            Результаты анализа
+        """
+        try:
+            # Загружаем файл
+            score = converter.parse(str(input_path))
+
+            # Получаем ноты в диапазоне
+            notes_info = NoteAnalyzer.get_note_range_overlap(
+                score, start_measure, end_measure, part_index
+            )
+
+            # Получаем интервалы
+            intervals = NoteAnalyzer.get_note_intervals(notes_info)
+
+            # Получаем статистику
+            statistics = NoteAnalyzer.get_note_statistics(notes_info)
+
+            return {
+                'notes': notes_info,
+                'intervals': intervals,
+                'statistics': statistics,
+                'total_notes': len(notes_info),
+                'total_intervals': len(intervals)
+            }
+
+        except Exception as e:
+            print(f"Ошибка при анализе нот: {e}")
+            return {'error': str(e)}
+
+    def export_note_analysis_to_json(self, input_path: str, output_path: str,
+                                     start_measure: int = 1,
+                                     end_measure: Optional[int] = None) -> None:
+        """
+        Экспортирует анализ нот в JSON файл.
+        """
+        try:
+            score = converter.parse(str(input_path))
+            notes_info = NoteAnalyzer.get_note_range_overlap(
+                score, start_measure, end_measure
+            )
+
+            NoteAnalyzer.export_to_json(notes_info, output_path)
+            print(f"✓ Анализ нот экспортирован в: {output_path}")
+
+        except Exception as e:
+            print(f"Ошибка при экспорте анализа: {e}")
 
     def extract_structural_metadata(self, score: Score) -> Dict[str, Any]:
         print("   Извлечение структурных метаданных...")
