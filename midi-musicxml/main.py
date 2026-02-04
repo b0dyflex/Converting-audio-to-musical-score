@@ -21,12 +21,7 @@ def interactive_mode():
             return None
     elif choice == '2':
         directory = input("Введите путь к директории: ").strip('"\' ')
-        if directory:
-            args = {'directory': directory}
-            recursive_choice = input("Рекурсивно обрабатывать поддиректории? (y/n): ").strip().lower()
-            args['recursive'] = recursive_choice == 'y'
-            return args
-        else:
+        if not directory:
             print("Не указана директория")
             return None
     else:
@@ -143,7 +138,6 @@ def main():
                 args.input_file = interactive_args['input_file']
             else:
                 args.directory = interactive_args['directory']
-                args.recursive = interactive_args.get('recursive', False)
         else:
             return
 
@@ -153,7 +147,7 @@ def main():
         print("КОНВЕРТАЦИЯ MIDI В MUSICXML")
         print("=" * 60)
 
-        result = converter.convert_single_file(args.input_file, args.output)
+        result = converter.convert_file(args.input_file, args.output)
 
         if result:
             print("\n" + "=" * 60)
@@ -169,7 +163,7 @@ def main():
         print("ПАКЕТНАЯ КОНВЕРТАЦИЯ MIDI В MUSICXML")
         print("=" * 60)
 
-        converter.convert_batch(args.directory, args.output_dir, args.recursive)
+        converter.convert_batch(args.directory, r'C:/Users/papak/Converting-audio-to-musical-score/musicxml/')
 
 
 if __name__ == "__main__":
