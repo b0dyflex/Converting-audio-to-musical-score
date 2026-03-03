@@ -5,3 +5,4 @@ midi_to_fft/__pycache__/
 *wav
 *npy
 __pycache__/
+midi_to_fft/examples/*Identifier
