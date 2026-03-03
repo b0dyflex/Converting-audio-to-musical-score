@@ -1,12 +1,16 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-fft = np.load("./midi_to_fft/data/2_fft.npy")
+specs = np.load("./data/2_fft.npy")
+print("Полная размерность тензора:", specs.shape)
 
-print("Shape:", fft.shape)
-print("Min / Max:", fft.min(), fft.max())
+num_segments = specs.shape[0]
 
-plt.imshow(fft, aspect="auto", origin="lower")
-plt.colorbar()
-plt.title("FFT / Mel Spectrogram")
+fig, axes = plt.subplots(1, num_segments, figsize=(15, 4))
+
+for i in range(num_segments):
+    axes[i].imshow(specs[i], aspect="auto", origin="lower")
+    axes[i].set_title(f"Seg {i}")
+
+plt.tight_layout()
 plt.show()
