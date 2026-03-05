@@ -22,13 +22,17 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "midi_to_fft"))
+# Корень проекта (родитель Encoder_Decoder/) — чтобы midi_to_fft был виден как пакет
+_PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+# Сама папка midi_to_fft — чтобы работали голые импорты внутри пакета
+# (from config import ..., from midi_renderer import ... и т.д.)
+sys.path.insert(0, str(_PROJECT_ROOT / "midi_to_fft"))
 
 import numpy as np
 from tqdm import tqdm
 
-from midi_to_fft import config
-from midi_to_fft import fft_map_generator
+from midi_to_fft import AudioConfig, MidiToFFTMap
 from tokenizer import MidiTokenizer
 
 
@@ -49,8 +53,8 @@ def prepare(
 
     print(f"Найдено {len(midi_files)} MIDI-файлов")
 
-    conf = config.AudioConfig()
-    pipeline = fft_map_generator.MidiToFFTMap(soundfont_path=soundfont_path, config=conf)
+    conf = AudioConfig()
+    pipeline = MidiToFFTMap(soundfont_path=soundfont_path, config=conf)
     tokenizer = MidiTokenizer(max_seq_len=max_seq_len)
 
     ok, err = 0, 0

@@ -20,10 +20,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "midi_to_fft"))
+_PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+sys.path.insert(0, str(_PROJECT_ROOT / "midi_to_fft"))
 
-from midi_to_fft import config
-from midi_to_fft import audio_processor
+from midi_to_fft import AudioConfig, SpectrogramProcessor
 
 from model import ScoreGenerationModel
 from tokenizer import MidiTokenizer, VOCAB_SIZE, decode_token
@@ -35,11 +36,11 @@ except ImportError:
     pretty_midi = None
 
 
-def load_audio_spectrogram(audio_path: str, config: config.AudioConfig) -> np.ndarray:
+def load_audio_spectrogram(audio_path: str, config: AudioConfig) -> np.ndarray:
     """Загружает WAV/MP3 и строит спектрограмму (N, F, T)."""
     import librosa
     audio, _ = librosa.load(audio_path, sr=config.sample_rate, mono=True)
-    processor = audio_processor.SpectrogramProcessor(config)
+    processor = SpectrogramProcessor(config)
     return processor.compute(audio)
 
 
@@ -99,7 +100,7 @@ def run(
     print(f"Устройство: {device}")
 
     # ── 1. Спектрограмма ─────────────────────────────────────
-    conf = config.AudioConfig()
+    conf = AudioConfig()
     spec = load_audio_spectrogram(audio_path, conf)   # (N, F, T)
     print(f"Спектрограмма: {spec.shape}")
 
