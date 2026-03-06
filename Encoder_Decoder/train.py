@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -36,6 +37,7 @@ CONFIG = dict(
     dataset_dir  = "dataset",
     output_dir   = "checkpoints",
     max_seq_len  = 512,
+    max_segments = 0,      # 0 = автоопределение из датасета
 
     # Архитектура
     d_model             = 128,
@@ -145,18 +147,21 @@ def train(cfg: dict):
     full_dataset = MidiSpectrogramDataset(
         dataset_root=cfg["dataset_dir"],
         max_seq_len=cfg["max_seq_len"],
+        max_segments=cfg["max_segments"],   # ← фиксированный размер N
     )
     n_val   = max(1, int(len(full_dataset) * cfg["val_ratio"]))
     n_train = len(full_dataset) - n_val
     train_ds, val_ds = random_split(full_dataset, [n_train, n_val])
 
+    # num_workers=0 на Windows (иначе multiprocessing конфликтует с PyTorch)
+    _num_workers = 0 if sys.platform == "win32" else 2
     train_loader = DataLoader(
         train_ds, batch_size=cfg["batch_size"],
-        shuffle=True, num_workers=2, pin_memory=True,
+        shuffle=True, num_workers=_num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg["batch_size"],
-        shuffle=False, num_workers=2, pin_memory=True,
+        shuffle=False, num_workers=_num_workers, pin_memory=True,
     )
     print(f"Train: {n_train}  |  Val: {n_val}")
 
@@ -181,7 +186,7 @@ def train(cfg: dict):
 
     total_steps = len(train_loader) * cfg["num_epochs"]
     scheduler   = WarmupCosineScheduler(optimizer, cfg["warmup_steps"], total_steps)
-    scaler      = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler      = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     # ── Опционально: загрузка чекпоинта ─────────────────────
     start_epoch = 0

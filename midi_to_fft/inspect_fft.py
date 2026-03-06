@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-specs = np.load("./data/2_fft.npy")
+specs = np.load("D:/token_dataset/sample_0001/spectrogram.npy")
 print("Полная размерность тензора:", specs.shape)
 
 num_segments = specs.shape[0]

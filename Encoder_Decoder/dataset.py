@@ -44,12 +44,14 @@ class MidiSpectrogramDataset(Dataset):
         self,
         dataset_root: str | Path,
         max_seq_len: int = 512,
+        max_segments: int = 64,    # ← максимальное число сегментов N
         max_freq_bins: int = 128,
         max_time_steps: int = 399,
         normalize_spectrogram: bool = True,
     ):
         self.root = Path(dataset_root)
         self.max_seq_len = max_seq_len
+        self.max_segments = max_segments    # ← сохраняем
         self.max_freq_bins = max_freq_bins
         self.max_time_steps = max_time_steps
         self.normalize = normalize_spectrogram
@@ -64,6 +66,16 @@ class MidiSpectrogramDataset(Dataset):
 
         if len(self.samples) == 0:
             raise RuntimeError(f"Нет данных в {self.root}. Запусти prepare_dataset.py")
+
+        # Если max_segments не задан явно — вычисляем из датасета
+        if max_segments == 0:
+            sizes = [np.load(d / "spectrogram.npy", mmap_mode="r").shape[0]
+                     for d in self.samples]
+            self.max_segments = int(np.max(sizes))
+            print(f"  max_segments автоопределён: {self.max_segments} "
+                  f"(min={min(sizes)}, max={max(sizes)})")
+        else:
+            self.max_segments = max_segments
 
         print(f"Dataset: {len(self.samples)} образцов в {self.root}")
 
@@ -108,21 +120,31 @@ class MidiSpectrogramDataset(Dataset):
 
     def _pad_spectrogram(self, spec: np.ndarray) -> np.ndarray:
         """
-        Нормирует спектрограмму до фиксированного числа частотных бин
-        и временных шагов, обрезая или добавляя нули.
+        Приводит спектрограмму к фиксированной форме (max_segments, max_freq_bins, max_time_steps).
+        Лишнее обрезается, недостающее дополняется нулями.
         """
         N, F, T = spec.shape
+        N_target = self.max_segments
         F_target = self.max_freq_bins
         T_target = self.max_time_steps
 
-        # Обрезка / паддинг по F
+        # ── 1. Обрезка / паддинг по N (число сегментов) ─────
+        if N > N_target:
+            spec = spec[:N_target, :, :]
+        elif N < N_target:
+            pad = np.zeros((N_target - N, F, T), dtype=spec.dtype)
+            spec = np.concatenate([spec, pad], axis=0)
+
+        N = spec.shape[0]   # теперь N == N_target
+
+        # ── 2. Обрезка / паддинг по F ───────────────────────
         if F > F_target:
             spec = spec[:, :F_target, :]
         elif F < F_target:
             pad = np.zeros((N, F_target - F, T), dtype=spec.dtype)
             spec = np.concatenate([spec, pad], axis=1)
 
-        # Обрезка / паддинг по T
+        # ── 3. Обрезка / паддинг по T ───────────────────────
         if T > T_target:
             spec = spec[:, :, :T_target]
         elif T < T_target:
