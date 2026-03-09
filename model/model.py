@@ -537,8 +537,17 @@ class AudioMusicDataset(Dataset):
             spectrogram = librosa.power_to_db(spectrogram, ref=np.max)
             spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-8)
 
-            # Преобразуем в тензор
-            spectrogram = torch.FloatTensor(spectrogram).unsqueeze(0)  # [1, n_mels, time]
+            # Преобразуем в тензор и паддим до фиксированной ширины
+            # (разные WAV имеют разную длину → разные time_steps → батч не собирается)
+            FIXED_TIME = 431  # ~10 сек при sr=22050, hop=512
+            spectrogram = torch.FloatTensor(spectrogram)  # [n_mels, time]
+            time_steps = spectrogram.shape[1]
+            if time_steps >= FIXED_TIME:
+                spectrogram = spectrogram[:, :FIXED_TIME]
+            else:
+                pad = torch.zeros(spectrogram.shape[0], FIXED_TIME - time_steps)
+                spectrogram = torch.cat([spectrogram, pad], dim=1)
+            spectrogram = spectrogram.unsqueeze(0)  # [1, n_mels, FIXED_TIME]
 
             # Токенизируем MIDI
             try:
@@ -566,8 +575,8 @@ class AudioMusicDataset(Dataset):
 
         except Exception as e:
             print(f"Error processing item {idx}: {e}")
-            # Возвращаем нулевые тензоры подходящего размера
-            spectrogram = torch.zeros(1, 128, 431)  # Стандартный размер
+            # Возвращаем нулевые тензоры фиксированного размера
+            spectrogram = torch.zeros(1, 128, 431)  # [1, n_mels, FIXED_TIME]
             token_tensor = torch.zeros(500, dtype=torch.long)
             return (spectrogram, token_tensor)
 
@@ -936,23 +945,20 @@ def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_wor
         batch_size = min(batch_size, len(train_dataset))
         print(f"Train/Val split: {train_size}/{val_size}")
 
-    # Определяем количество workers для DataLoader
-    if device.type == 'cuda':
-        num_workers = min(4, os.cpu_count() // 2) if os.cpu_count() > 4 else 2
-    else:
-        num_workers = 0
+    # num_workers=0 — обязательно на Windows: при num_workers>0 каждый
+    # worker-процесс импортирует model.py заново, что вызывает лишние
+    # print'ы ("Using device: cuda") и проблемы с multiprocessing.
+    num_workers = 0
 
     print(f"Using batch size: {batch_size}, num_workers: {num_workers}")
 
-    # Создаём DataLoader с оптимизацией для GPU
+    # Создаём DataLoader
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=2 if num_workers > 0 else None,
-        persistent_workers=True if num_workers > 0 else False
+        num_workers=0,
+        pin_memory=(device.type == 'cuda'),
     )
 
     if val_dataset:
@@ -960,9 +966,8 @@ def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_wor
             val_dataset,
             batch_size=min(batch_size, len(val_dataset)),
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=2 if num_workers > 0 else None
+            num_workers=0,
+            pin_memory=(device.type == 'cuda'),
         )
     else:
         val_loader = None
@@ -1020,6 +1025,36 @@ def create_simulated_data(data_dir):
 
 # ==================== Inference Pipeline ====================
 
+def _infer_arch_from_checkpoint(checkpoint: dict) -> tuple:
+    """
+    Определяет архитектуру модели (hidden_dim, enc_layers, dec_layers)
+    непосредственно из весов сохранённого чекпоинта.
+    Это необходимо потому, что во время обучения размер модели выбирается
+    автоматически в зависимости от доступной VRAM, и может отличаться
+    от жёстко заданных дефолтных значений.
+    """
+    state = checkpoint['model_state_dict']
+
+    # hidden_dim — размер bias вектора conv_reduce
+    hidden_dim = state['encoder.conv_reduce.bias'].shape[0]
+
+    # enc_layers — количество слоёв энкодера (считаем уникальные индексы)
+    enc_layers = sum(
+        1 for k in state
+        if k.startswith('encoder.transformer_encoder.layers.')
+        and k.endswith('.norm1.weight')
+    )
+
+    # dec_layers — количество слоёв декодера
+    dec_layers = sum(
+        1 for k in state
+        if k.startswith('decoder.transformer_decoder.layers.')
+        and k.endswith('.norm1.weight')
+    )
+
+    return hidden_dim, enc_layers, dec_layers
+
+
 class Audio2MusicInference:
     """Класс для инференса модели"""
 
@@ -1047,16 +1082,22 @@ class Audio2MusicInference:
         print(f"Loading model from: {model_path}")
 
         # Загружаем чекпоинт
-        checkpoint = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         self.tokenizer = checkpoint['tokenizer']
         vocab_size = checkpoint['vocab_size']
 
-        # Создаём и загружаем модель
+        # Читаем архитектуру из чекпоинта — она могла отличаться от дефолтной
+        # в зависимости от доступной VRAM во время обучения
+        hidden_dim, enc_layers, dec_layers = _infer_arch_from_checkpoint(checkpoint)
+        print(f"  Архитектура из чекпоинта: hidden_dim={hidden_dim}, "
+              f"enc_layers={enc_layers}, dec_layers={dec_layers}")
+
+        # Создаём и загружаем модель с правильными размерами
         self.model = Audio2MusicModel(
             vocab_size=vocab_size,
-            hidden_dim=512,
-            num_encoder_layers=4,
-            num_decoder_layers=6
+            hidden_dim=hidden_dim,
+            num_encoder_layers=enc_layers,
+            num_decoder_layers=dec_layers
         ).to(device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
