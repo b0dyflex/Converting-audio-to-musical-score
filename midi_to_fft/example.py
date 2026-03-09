@@ -9,9 +9,9 @@ pipeline = MidiToFFTMap(
 )
 
 fft_map = pipeline.process(
-    midi_path="examples/2.mid",
-    output_wav="data/2.wav",
-    output_fft="data/2_fft.npy"
+    midi_path="examples/1.mid",
+    output_wav="data/1.wav",
+    output_fft="data/1_fft.npy"
 )
 
 print("FFT map shape:", fft_map.shape)

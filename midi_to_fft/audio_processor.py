@@ -1,6 +1,35 @@
+"""
+SpectrogramProcessor
+====================
+Преобразует аудио-сигнал в набор Mel-спектрограмм (один .npy файл = один трек).
+
+Выход: np.ndarray формы (num_segments, n_mels, time_steps), dtype=float32
+
+Параметры по умолчанию (AudioConfig):
+  sample_rate  = 22050 Гц
+  n_fft        = 2048  (~93 мс)
+  hop_length   = 512   (~23 мс)
+  win_length   = 1024  (~46 мс)
+  n_mels       = 128
+  fmax         = 8000 Гц
+  segment_sec  = 5.0 с → 216 фреймов на сегмент при hop=512
+
+Почему Mel, а не сырой FFT:
+  - Mel-шкала логарифмична по частоте, как слух человека
+  - Каждая октава занимает одинаковую полосу, ноты равномерно распределены
+  - 128 Mel-бин охватывают 0–8000 Гц с хорошим разрешением внизу
+  - Сырой FFT с n_fft=4096 давал 2049 бин, из которых используется лишь 128
+    (линейная нижняя часть) — большинство нотных различий теряется
+"""
+
 import numpy as np
 import librosa
 from config import AudioConfig
+
+
+# Константа: диапазон dB для нормировки (стандарт для музыки)
+_DB_MIN = -80.0   # librosa power_to_db с top_db=80 даёт нижний предел −80 дБ
+_DB_MAX =   0.0   # максимум всегда 0 дБ (ref=np.max)
 
 
 class SpectrogramProcessor:
@@ -9,84 +38,75 @@ class SpectrogramProcessor:
 
     def compute(self, audio: np.ndarray) -> np.ndarray:
         """
-        Разбивает аудио на временные сегменты фиксированной длины.
-        Для каждого сегмента строится спектрограмма (STFT).
+        Разбивает аудио на сегменты и строит Mel-спектрограмму для каждого.
 
         Возвращает:
-            np.ndarray формы:
-            (num_segments, freq_bins, time_steps)
+            np.ndarray формы (num_segments, n_mels, time_steps), float32
+            Значения нормированы в диапазон [0, 1] по дБ-шкале.
+            0.0 = тишина (−80 дБ), 1.0 = максимальная амплитуда (0 дБ)
         """
+        cfg = self.config
+        sr  = cfg.sample_rate
 
-        sr = self.config.sample_rate
-
-        # ===== 1. Параметры сегмента =====
-        segment_size = int(sr * self.config.segment_size_sec)
-        if segment_size <= 0:
+        # ── 1. Параметры сегмента ─────────────────────────────
+        segment_len = int(sr * cfg.segment_size_sec)
+        if segment_len <= 0:
             raise ValueError("segment_size_sec слишком мал")
 
-        # ===== 2. Параметры STFT =====
-        window_size = int(sr * self.config.window_size_ms / 1000)
-        overlap = np.clip(self.config.overlap, 0.0, 0.99)
-        hop = int(window_size * (1 - overlap))
-
-        window = np.hanning(window_size)
-
-        # ===== 3. Padding всего трека до кратности сегменту =====
-        total_len = len(audio)
-        remainder = total_len % segment_size
-
+        # ── 2. Padding до кратного segment_len ───────────────
+        remainder = len(audio) % segment_len
         if remainder != 0:
-            pad_width = segment_size - remainder
-            audio = np.pad(audio, (0, pad_width))
+            audio = np.pad(audio, (0, segment_len - remainder))
 
-        num_segments = len(audio) // segment_size
-
+        num_segments = len(audio) // segment_len
         all_specs = []
 
-        # ===== 4. Обработка каждого сегмента =====
-        for seg_idx in range(num_segments):
+        # ── 3. Mel-спектрограмма для каждого сегмента ────────
+        for i in range(num_segments):
+            seg = audio[i * segment_len : (i + 1) * segment_len]
 
-            start = seg_idx * segment_size
-            end = start + segment_size
-            segment_audio = audio[start:end]
-
-            frames = []
-
-            # ---- STFT внутри сегмента ----
-            for frame_start in range(0, len(segment_audio) - window_size + 1, hop):
-                frame = segment_audio[frame_start:frame_start + window_size]
-                frame = frame * window
-
-                spectrum = np.fft.rfft(frame, n=self.config.n_fft)
-                magnitude = np.abs(spectrum)
-
-                frames.append(magnitude)
-
-            if len(frames) == 0:
-                continue
-
-            spec = np.array(frames).T  # (freq_bins, time_steps)
-
-            # ---- Mel-проекция ----
-            if self.config.use_mel:
-                mel_basis = librosa.filters.mel(
+            if cfg.use_mel:
+                # Mel-спектрограмма через librosa (оптимизировано, быстрее ручного цикла)
+                mel = librosa.feature.melspectrogram(
+                    y=seg,
                     sr=sr,
-                    n_fft=self.config.n_fft,
-                    n_mels=self.config.n_mels
+                    n_fft=cfg.n_fft,
+                    hop_length=cfg.hop_length,
+                    win_length=cfg.win_length,
+                    n_mels=cfg.n_mels,
+                    fmax=cfg.fmax,
+                    center=True,
                 )
-                spec = np.dot(mel_basis, spec)
-
-            # ---- Логарифмирование ----
-            if self.config.log_scale:
-                spec = librosa.power_to_db(spec ** 2, ref=np.max)
+                if cfg.log_scale:
+                    spec = librosa.power_to_db(mel, ref=np.max, top_db=80.0)
+                else:
+                    spec = mel
+            else:
+                # Сырой FFT (оставлен для совместимости, не рекомендуется)
+                stft = librosa.stft(
+                    seg,
+                    n_fft=cfg.n_fft,
+                    hop_length=cfg.hop_length,
+                    win_length=cfg.win_length,
+                    center=True,
+                )
+                spec = np.abs(stft)
+                if cfg.log_scale:
+                    spec = librosa.power_to_db(spec ** 2, ref=np.max, top_db=80.0)
 
             all_specs.append(spec)
 
-        if len(all_specs) == 0:
-            raise ValueError("Не удалось сформировать сегменты")
+        if not all_specs:
+            raise ValueError("Не удалось сформировать ни одного сегмента")
 
-        # (num_segments, freq_bins, time_steps)
-        spectrograms = np.stack(all_specs, axis=0)
+        # ── 4. Стек и нормировка в [0, 1] ─────────────────────
+        # (num_segments, n_mels/freq_bins, time_steps)
+        spectrograms = np.stack(all_specs, axis=0).astype(np.float32)
 
-        return spectrograms.astype(np.float32)
+        if cfg.log_scale:
+            # dB диапазон: [−80, 0] → нормируем в [0, 1]
+            # Это устойчивая нормировка: диапазон одинаков для всех сэмплов
+            spectrograms = (spectrograms - _DB_MIN) / (_DB_MAX - _DB_MIN)
+            spectrograms = np.clip(spectrograms, 0.0, 1.0)
 
+        return spectrograms

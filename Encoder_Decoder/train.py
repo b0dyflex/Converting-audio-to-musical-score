@@ -12,24 +12,18 @@ train.py
 """
 
 """
-train.py  v2
+train.py  v3
 ============
-Улучшения по сравнению с v1:
+Ключевые изменения:
+  - lr_decoder = 1e-3
+  - lr_encoder = 1e-4  (backbone дообучается медленно)
+  - warmup_steps = 300
+  - imagenet_norm = True — датасет возвращает 3-канальный ImageNet-нормированный тензор
+  - pretrained_encoder = True — используем ResNet18 с весами ImageNet
+  - max_time_steps = 216 (для Mel+hop=512: 5 сек ≈ 216 фреймов, было 256/399)
 
-1. CONFIG по умолчанию соответствует model.py v2 (d_model=256, 6 слоёв)
-2. Раздельные lr для encoder/decoder (энкодер обучается медленнее)
-3. Gradient Accumulation — эффективный batch_size без OOM
-4. EMA (Exponential Moving Average) весов — стабильнее val метрики
-5. Логирование в CSV (epoch_metrics.csv + step_metrics.csv)
-
-Запуск:
-    python train.py --dataset_dir dataset/ --output_dir checkpoints/
-
-Для 8 ГБ GPU с gradient accumulation:
-    python train.py --batch_size 2 --accum_steps 4  # эффективный batch = 8
+ВАЖНО: после смены audio_processor на Mel нужно заново запустить prepare_dataset.py!
 """
-
-#from __future__ import annotations
 
 import argparse
 import copy
@@ -53,41 +47,46 @@ from tokenizer import PAD_TOKEN, VOCAB_SIZE
 # ══════════════════════════════════════════════════════════════
 CONFIG = dict(
     # Данные
-    dataset_dir   = "dataset",
-    output_dir    = "checkpoints",
-    max_seq_len   = 256,        # ограничено: длинные seq → огромные attention матрицы
-    max_segments  = 16,         # ограничено: N=64 → 128 CNN forward за батч → OOM
-    max_freq_bins = 128,
-    max_time_steps = 256,       # было 399 → уменьшено для экономии CNN памяти
+    dataset_dir     = "dataset",
+    output_dir      = "checkpoints",
+    max_seq_len     = 256,
+    max_segments    = 0,        # 0 = автоопределение
+    max_freq_bins   = 128,
+    max_time_steps  = 216,      # Mel + hop=512 + segment=5 сек ≈ 216 фреймов
 
-    # Архитектура (оптимизировано под 8 ГБ)
+    # Архитектура
     d_model             = 256,
     nhead               = 8,
     num_encoder_layers  = 1,
     num_decoder_layers  = 6,
     dim_feedforward     = 1024,
     dropout             = 0.1,
+    pretrained_encoder  = True,   # ← использовать предобученный ResNet18
+    imagenet_norm       = True,   # ← нормировка под ImageNet (нужна при pretrained=True)
 
     # Обучение
-    batch_size       = 2,
-    accum_steps      = 4,       # эффективный batch = 8
-    cnn_chunk        = 8,       # сегментов через CNN за раз (меньше = меньше памяти)
-    num_epochs       = 60,
-    lr               = 3e-4,
-    encoder_lr_scale = 0.1,     # lr энкодера = lr * encoder_lr_scale
-    weight_decay     = 1e-2,
-    warmup_steps     = 1000,
-    grad_clip        = 1.0,
-    val_ratio        = 0.1,
-    log_every        = 50,
-    save_every       = 5,
-    use_ema          = True,
-    ema_decay        = 0.999,
+    batch_size      = 2,
+    accum_steps     = 4,          # эффективный batch = 8
+    cnn_chunk       = 8,
+    num_epochs      = 60,
+
+    # LR — КЛЮЧЕВОЕ ИЗМЕНЕНИЕ по совету научрука
+    lr_decoder      = 1e-3,       # ← Transformer decoder: высокий LR
+    lr_encoder      = 1e-4,       # ← ResNet18 backbone: низкий LR (дообучаем осторожно)
+
+    weight_decay    = 1e-2,
+    warmup_steps    = 300,        # было 1000 — слишком долго (~21 эпоха warmup)
+    grad_clip       = 1.0,
+    val_ratio       = 0.1,
+    log_every       = 50,
+    save_every      = 5,
+    use_ema         = True,
+    ema_decay       = 0.999,
 )
 
 
 # ══════════════════════════════════════════════════════════════
-#  Планировщик
+#  Планировщик: warmup + cosine decay
 # ══════════════════════════════════════════════════════════════
 class WarmupCosineScheduler(torch.optim.lr_scheduler.LambdaLR):
     def __init__(self, optimizer, warmup_steps: int, total_steps: int):
@@ -95,17 +94,17 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler.LambdaLR):
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * t)))
         super().__init__(optimizer, lr_lambda)
 
 
 # ══════════════════════════════════════════════════════════════
-#  EMA
+#  EMA весов
 # ══════════════════════════════════════════════════════════════
 class ModelEMA:
     def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay = decay
+        self.decay  = decay
         self.shadow = copy.deepcopy(model)
         self.shadow.eval()
         for p in self.shadow.parameters():
@@ -121,34 +120,38 @@ class ModelEMA:
 
 
 # ══════════════════════════════════════════════════════════════
-#  Метрики и логгер
+#  Утилиты
 # ══════════════════════════════════════════════════════════════
 def accuracy_no_pad(logits, targets):
-    preds = logits.argmax(dim=-1)
-    mask = targets != PAD_TOKEN
+    preds   = logits.argmax(dim=-1)
+    mask    = targets != PAD_TOKEN
     correct = (preds[mask] == targets[mask]).sum().item()
-    total = mask.sum().item()
+    total   = mask.sum().item()
     return correct / total if total > 0 else 0.0
 
 
 class MetricsLogger:
     def __init__(self, path: Path):
-        self.path = path
+        self.path       = path
         self._step_path = path.parent / "step_metrics.csv"
-        with open(self.path, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch","train_loss","train_acc","val_loss","val_acc","lr","elapsed_s"])
-        with open(self._step_path, "w", newline="") as f:
-            csv.writer(f).writerow(["global_step","epoch","step","loss","acc","lr"])
         self.global_step = 0
+        with open(self.path, "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["epoch","train_loss","train_acc","val_loss","val_acc","lr_dec","lr_enc","elapsed_s"])
+        with open(self._step_path, "w", newline="") as f:
+            csv.writer(f).writerow(["global_step","epoch","step","loss","acc","lr_dec"])
 
-    def log_step(self, epoch, step, loss, acc, lr):
+    def log_step(self, epoch, step, loss, acc, lr_dec):
         self.global_step += 1
         with open(self._step_path, "a", newline="") as f:
-            csv.writer(f).writerow([self.global_step, epoch, step, f"{loss:.6f}", f"{acc:.6f}", f"{lr:.8f}"])
+            csv.writer(f).writerow(
+                [self.global_step, epoch, step, f"{loss:.6f}", f"{acc:.6f}", f"{lr_dec:.8f}"])
 
-    def log_epoch(self, epoch, tl, ta, vl, va, lr, elapsed):
+    def log_epoch(self, epoch, tl, ta, vl, va, lr_dec, lr_enc, elapsed):
         with open(self.path, "a", newline="") as f:
-            csv.writer(f).writerow([epoch, f"{tl:.6f}", f"{ta:.6f}", f"{vl:.6f}", f"{va:.6f}", f"{lr:.8f}", f"{elapsed:.1f}"])
+            csv.writer(f).writerow(
+                [epoch, f"{tl:.6f}", f"{ta:.6f}", f"{vl:.6f}", f"{va:.6f}",
+                 f"{lr_dec:.8f}", f"{lr_enc:.8f}", f"{elapsed:.1f}"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -156,16 +159,12 @@ class MetricsLogger:
 # ══════════════════════════════════════════════════════════════
 def train_step(model, batch, criterion, scaler, device, accum_steps, step_idx, cnn_chunk=8):
     specs, src, tgt, pad_mask = [t.to(device) for t in batch]
-    is_last_accum = (step_idx + 1) % accum_steps == 0
-
     with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
         logits = model(specs, src, tgt_key_padding_mask=pad_mask, cnn_chunk=cnn_chunk)
-        loss   = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
-        loss   = loss / accum_steps
-
+        loss   = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1)) / accum_steps
     scaler.scale(loss).backward()
     acc = accuracy_no_pad(logits.detach(), tgt)
-    return loss.item() * accum_steps, acc, is_last_accum
+    return loss.item() * accum_steps, acc, (step_idx + 1) % accum_steps == 0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -174,16 +173,15 @@ def train_step(model, batch, criterion, scaler, device, accum_steps, step_idx, c
 @torch.no_grad()
 def validate(model, loader, criterion, device):
     model.eval()
-    total_loss, total_acc, n = 0.0, 0.0, 0
+    tot_loss, tot_acc, n = 0.0, 0.0, 0
     for batch in loader:
         specs, src, tgt, pad_mask = [t.to(device) for t in batch]
         logits = model(specs, src, tgt_key_padding_mask=pad_mask)
-        loss   = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
-        total_loss += loss.item()
-        total_acc  += accuracy_no_pad(logits, tgt)
+        tot_loss += criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1)).item()
+        tot_acc  += accuracy_no_pad(logits, tgt)
         n += 1
     model.train()
-    return total_loss / n, total_acc / n
+    return tot_loss / n, tot_acc / n
 
 
 # ══════════════════════════════════════════════════════════════
@@ -192,8 +190,6 @@ def validate(model, loader, criterion, device):
 def train(cfg: dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Устройство: {device}")
-    import os
-    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     torch.cuda.empty_cache()
 
     out_dir = Path(cfg["output_dir"])
@@ -202,11 +198,12 @@ def train(cfg: dict):
 
     # ── Данные ───────────────────────────────────────────────
     full_dataset = MidiSpectrogramDataset(
-        dataset_root=cfg["dataset_dir"],
-        max_seq_len=cfg["max_seq_len"],
-        max_segments=cfg["max_segments"],
-        max_freq_bins=cfg.get("max_freq_bins", 128),
-        max_time_steps=cfg.get("max_time_steps", 256),
+        dataset_root   = cfg["dataset_dir"],
+        max_seq_len    = cfg["max_seq_len"],
+        max_segments   = cfg["max_segments"],
+        max_freq_bins  = cfg["max_freq_bins"],
+        max_time_steps = cfg["max_time_steps"],
+        imagenet_norm  = cfg["imagenet_norm"],
     )
     n_val   = max(1, int(len(full_dataset) * cfg["val_ratio"]))
     n_train = len(full_dataset) - n_val
@@ -217,66 +214,70 @@ def train(cfg: dict):
                               shuffle=True,  num_workers=_nw, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"],
                               shuffle=False, num_workers=_nw, pin_memory=True)
-    print(f"Train: {n_train}  |  Val: {n_val}")
-    print(f"Эффективный batch: {cfg['batch_size'] * cfg['accum_steps']}")
+    print(f"Train: {n_train}  |  Val: {n_val}  |  Eff.batch: {cfg['batch_size']*cfg['accum_steps']}")
 
     # ── Модель ───────────────────────────────────────────────
     model = ScoreGenerationModel(
-        d_model=cfg["d_model"],
-        nhead=cfg["nhead"],
-        num_encoder_layers=cfg["num_encoder_layers"],
-        num_decoder_layers=cfg["num_decoder_layers"],
-        dim_feedforward=cfg["dim_feedforward"],
-        vocab_size=VOCAB_SIZE,
-        max_seq_len=cfg["max_seq_len"],
-        dropout=cfg["dropout"],
+        d_model            = cfg["d_model"],
+        nhead              = cfg["nhead"],
+        num_encoder_layers = cfg["num_encoder_layers"],
+        num_decoder_layers = cfg["num_decoder_layers"],
+        dim_feedforward    = cfg["dim_feedforward"],
+        vocab_size         = VOCAB_SIZE,
+        max_seq_len        = cfg["max_seq_len"],
+        dropout            = cfg["dropout"],
+        pretrained_encoder = cfg["pretrained_encoder"],
     ).to(device)
 
     ema = ModelEMA(model, decay=cfg["ema_decay"]) if cfg["use_ema"] else None
 
-    # ── Раздельный lr для encoder и decoder ──────────────────
-    optimizer = torch.optim.AdamW([
-        {"params": list(model.encoder.parameters()),
-         "lr": cfg["lr"] * cfg["encoder_lr_scale"]},
-        {"params": list(model.decoder.parameters()),
-         "lr": cfg["lr"]},
-    ], weight_decay=cfg["weight_decay"])
+    # ── Раздельный LR: encoder (backbone) vs decoder ─────────
+    optimizer = torch.optim.AdamW(
+        model.get_param_groups(
+            encoder_lr = cfg["lr_encoder"],   # 1e-4 — backbone медленно
+            decoder_lr = cfg["lr_decoder"],   # 1e-3 — transformer быстро
+        ),
+        weight_decay = cfg["weight_decay"],
+    )
 
     total_steps = (len(train_loader) // cfg["accum_steps"]) * cfg["num_epochs"]
     scheduler   = WarmupCosineScheduler(optimizer, cfg["warmup_steps"], total_steps)
     scaler      = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     criterion   = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN, label_smoothing=0.1)
 
+    print(f"LR decoder={cfg['lr_decoder']:.0e}  encoder={cfg['lr_encoder']:.0e}  "
+          f"warmup={cfg['warmup_steps']} steps")
+
     # ── Загрузка чекпоинта ───────────────────────────────────
-    start_epoch = 0
-    ckpt_path   = out_dir / "last.pt"
+    start_epoch  = 0
+    best_val_loss = float("inf")
+    ckpt_path    = out_dir / "last.pt"
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
-        start_epoch = ckpt["epoch"] + 1
+        start_epoch   = ckpt["epoch"] + 1
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
         if ema and "ema" in ckpt:
             ema.shadow.load_state_dict(ckpt["ema"])
-        print(f"Возобновление с эпохи {start_epoch}")
+        print(f"Возобновление с эпохи {start_epoch} (best val_loss={best_val_loss:.4f})")
 
     # ── Цикл ─────────────────────────────────────────────────
-    best_val_loss = float("inf")
     model.train()
     optimizer.zero_grad()
 
     for epoch in range(start_epoch, cfg["num_epochs"]):
-        epoch_loss, epoch_acc = 0.0, 0.0
+        ep_loss, ep_acc = 0.0, 0.0
         t0 = time.time()
 
         for step_idx, batch in enumerate(train_loader):
             loss, acc, do_update = train_step(
                 model, batch, criterion, scaler, device,
-                cfg["accum_steps"], step_idx,
-                cnn_chunk=cfg.get("cnn_chunk", 8),
+                cfg["accum_steps"], step_idx, cnn_chunk=cfg.get("cnn_chunk", 8),
             )
-            epoch_loss += loss
-            epoch_acc  += acc
+            ep_loss += loss
+            ep_acc  += acc
 
             if do_update:
                 scaler.unscale_(optimizer)
@@ -288,28 +289,28 @@ def train(cfg: dict):
                 if ema:
                     ema.update(model)
 
-            lr_now = scheduler.get_last_lr()[0]
-            logger.log_step(epoch + 1, step_idx + 1, loss, acc, lr_now)
+            lr_dec = optimizer.param_groups[1]["lr"]
+            logger.log_step(epoch + 1, step_idx + 1, loss, acc, lr_dec)
 
             if (step_idx + 1) % cfg["log_every"] == 0:
-                print(f"  Epoch {epoch+1}/{cfg['num_epochs']} "
+                lr_enc = optimizer.param_groups[0]["lr"]
+                print(f"  Ep {epoch+1}/{cfg['num_epochs']} "
                       f"step {step_idx+1}/{len(train_loader)} | "
-                      f"loss={loss:.4f}  acc={acc:.3f}  lr={lr_now:.2e}")
+                      f"loss={loss:.4f}  acc={acc:.3f}  "
+                      f"lr_dec={lr_dec:.2e}  lr_enc={lr_enc:.2e}")
 
-        avg_loss = epoch_loss / len(train_loader)
-        avg_acc  = epoch_acc  / len(train_loader)
+        avg_loss  = ep_loss / len(train_loader)
+        avg_acc   = ep_acc  / len(train_loader)
         val_model = ema.get_model() if ema else model
         val_loss, val_acc = validate(val_model, val_loader, criterion, device)
-        elapsed = time.time() - t0
+        elapsed   = time.time() - t0
 
-        lr_now = scheduler.get_last_lr()[0]
-        logger.log_epoch(epoch + 1, avg_loss, avg_acc, val_loss, val_acc, lr_now, elapsed)
-
-        ema_tag = " [EMA]" if ema else ""
+        lr_dec = optimizer.param_groups[1]["lr"]
+        lr_enc = optimizer.param_groups[0]["lr"]
+        logger.log_epoch(epoch+1, avg_loss, avg_acc, val_loss, val_acc, lr_dec, lr_enc, elapsed)
         print(f"Epoch {epoch+1:3d} | "
               f"train loss={avg_loss:.4f} acc={avg_acc:.3f} | "
-              f"val{ema_tag} loss={val_loss:.4f} acc={val_acc:.3f} | "
-              f"{elapsed:.1f}s")
+              f"val loss={val_loss:.4f} acc={val_acc:.3f} | {elapsed:.1f}s")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -322,14 +323,13 @@ def train(cfg: dict):
                 "epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "val_loss": val_loss,
+                "val_loss":  val_loss, "best_val_loss": best_val_loss,
             }
             if ema:
                 ckpt_data["ema"] = ema.shadow.state_dict()
             torch.save(ckpt_data, ckpt_path)
 
     print("Обучение завершено!")
-    print(f"\nДля просмотра графиков: python plot_training.py --metrics_dir {out_dir}")
 
 
 # ══════════════════════════════════════════════════════════════
