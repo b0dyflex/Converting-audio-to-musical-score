@@ -50,7 +50,7 @@ def load_csv(path: Path) -> dict[str, list]:
         reader = csv.DictReader(f)
         for row in reader:
             for k, v in row.items():
-                data.setdefault(k, []).append(float(v))
+                data.setdefault(k, []).append(float(v) if v else 0.0)
     return data
 
 
@@ -115,33 +115,49 @@ def plot(metrics_dir: str, save_path: str | None = None):
 
     # ── 3. Learning Rate ──────────────────────────────────
     ax3 = fig.add_subplot(gs[0, 2])
-    if has_step:
+
+    # Проверяем наличие lr в step_data
+    if has_step and "lr" in step_data:
         steps = step_data["global_step"]
         ax3.plot(steps, step_data["lr"], color=ACCENT_LR, lw=1.2, alpha=0.9)
         ax3.fill_between(steps, step_data["lr"], alpha=0.15, color=ACCENT_LR)
-    elif has_epoch:
+        ax3.set_xlabel("Step")
+    elif has_epoch and "lr" in epoch_data:
         ax3.plot(epoch_data["epoch"], epoch_data["lr"], color=ACCENT_LR,
                  lw=2, marker="o", markersize=3)
+        ax3.set_xlabel("Epoch")
+    else:
+        # Если нет данных о LR, показываем заглушку
+        ax3.text(0.5, 0.5, "No LR data",
+                ha="center", va="center", transform=ax3.transAxes,
+                color="#666666", fontsize=12)
+        ax3.set_xlabel("")
+
     ax3.set_title("LEARNING RATE", fontsize=10, color="#aaaaaa", pad=8)
-    ax3.set_xlabel("Step" if has_step else "Epoch")
     ax3.set_ylabel("LR")
     ax3.yaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter(useMathText=True))
     ax3.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
     # ── 4. Step Loss (сглаженный) ─────────────────────────
     ax4 = fig.add_subplot(gs[1, 0:2])
-    if has_step:
+    if has_step and "loss" in step_data:
         steps = step_data["global_step"]
         raw   = step_data["loss"]
         sm    = smooth(raw, window=max(1, len(raw) // 50))
         ax4.plot(steps, raw, color=ACCENT_STEP, lw=0.5, alpha=0.25, label="Raw")
         ax4.plot(steps, sm,  color=ACCENT_STEP, lw=2,   alpha=0.95, label="Smoothed")
         ax4.legend(fontsize=8)
+        ax4.set_xlabel("Global Step")
     elif has_epoch:
         ax4.plot(epoch_data["epoch"], epoch_data["train_loss"],
                  color=ACCENT_STEP, lw=2, marker="o", markersize=3)
+        ax4.set_xlabel("Epoch")
+    else:
+        ax4.text(0.5, 0.5, "No loss data",
+                ha="center", va="center", transform=ax4.transAxes,
+                color="#666666", fontsize=12)
+
     ax4.set_title("STEP LOSS (TRAIN)", fontsize=10, color="#aaaaaa", pad=8)
-    ax4.set_xlabel("Global Step" if has_step else "Epoch")
     ax4.set_ylabel("Loss")
 
     # ── 5. Epoch summary table ────────────────────────────
@@ -173,6 +189,11 @@ def plot(metrics_dir: str, save_path: str | None = None):
             if r == 0:
                 cell.set_facecolor("#222222")
                 cell.set_text_props(color=ACCENT_TRAIN, fontweight="bold")
+    else:
+        ax5.text(0.5, 0.5, "No epoch data",
+                ha="center", va="center", transform=ax5.transAxes,
+                color="#666666", fontsize=12)
+
     ax5.set_title("LAST EPOCHS", fontsize=10, color="#aaaaaa", pad=8)
 
     # Статистика в заголовке

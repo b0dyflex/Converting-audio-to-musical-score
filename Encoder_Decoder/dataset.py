@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 MidiDataset
 ===========
@@ -31,7 +32,6 @@ MidiSpectrogramDataset
                  (N, 1, F, T) если imagenet_norm=False  (для custom CNN)
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Tuple
@@ -83,10 +83,18 @@ class MidiSpectrogramDataset(Dataset):
             raise RuntimeError(f"Нет данных в {self.root}. Запусти prepare_dataset.py")
 
         # Автоопределение max_segments
+        _MAX_SEGMENTS_SAFE = 64   # жёсткий cap для 8 ГБ GPU (ResNet18 + d_model=256)
         if max_segments == 0:
             sizes = [np.load(d / "spectrogram.npy", mmap_mode="r").shape[0]
                      for d in self.samples]
-            self.max_segments = int(np.max(sizes))
+            auto = int(np.max(sizes))
+            if auto > _MAX_SEGMENTS_SAFE:
+                print(f"  [WARN] max_segments автоопределён как {auto}, "
+                      f"но ограничен до {_MAX_SEGMENTS_SAFE} во избежание OOM. "
+                      f"Передайте max_segments явно чтобы изменить.")
+                self.max_segments = _MAX_SEGMENTS_SAFE
+            else:
+                self.max_segments = auto
             print(f"  max_segments автоопределён: {self.max_segments} "
                   f"(min={min(sizes)}, median={int(np.median(sizes))}, max={max(sizes)})")
         else:

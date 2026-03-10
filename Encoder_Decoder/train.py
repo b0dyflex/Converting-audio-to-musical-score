@@ -1,4 +1,4 @@
-#from __future__ import annotations
+from __future__ import annotations
 """
 train.py
 ========
@@ -50,7 +50,7 @@ CONFIG = dict(
     dataset_dir     = "dataset",
     output_dir      = "checkpoints",
     max_seq_len     = 256,
-    max_segments    = 0,        # 0 = автоопределение
+    max_segments    = 64,       # ВАЖНО: ограничиваем сегменты — иначе OOM на 8 ГБ GPU
     max_freq_bins   = 128,
     max_time_steps  = 216,      # Mel + hop=512 + segment=5 сек ≈ 216 фреймов
 
@@ -65,9 +65,9 @@ CONFIG = dict(
     imagenet_norm       = True,   # ← нормировка под ImageNet (нужна при pretrained=True)
 
     # Обучение
-    batch_size      = 2,
-    accum_steps     = 4,          # эффективный batch = 8
-    cnn_chunk       = 8,
+    batch_size      = 1,          # 1 на 8 ГБ GPU с max_segments=64
+    accum_steps     = 8,          # эффективный batch = 8
+    cnn_chunk       = 4,          # обрабатываем CNN по 4 сегмента за раз — меньше пиковая память
     num_epochs      = 60,
 
     # LR — КЛЮЧЕВОЕ ИЗМЕНЕНИЕ по совету научрука
