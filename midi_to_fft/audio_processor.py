@@ -26,10 +26,9 @@ import numpy as np
 import librosa
 from config import AudioConfig
 
-
 # Константа: диапазон dB для нормировки (стандарт для музыки)
-_DB_MIN = -80.0   # librosa power_to_db с top_db=80 даёт нижний предел −80 дБ
-_DB_MAX =   0.0   # максимум всегда 0 дБ (ref=np.max)
+_DB_MIN = -80.0  # librosa power_to_db с top_db=80 даёт нижний предел −80 дБ
+_DB_MAX = 0.0  # максимум всегда 0 дБ (ref=np.max)
 
 
 class SpectrogramProcessor:
@@ -46,7 +45,7 @@ class SpectrogramProcessor:
             0.0 = тишина (−80 дБ), 1.0 = максимальная амплитуда (0 дБ)
         """
         cfg = self.config
-        sr  = cfg.sample_rate
+        sr = cfg.sample_rate
 
         # ── 1. Параметры сегмента ─────────────────────────────
         segment_len = int(sr * cfg.segment_size_sec)
@@ -63,10 +62,10 @@ class SpectrogramProcessor:
 
         # ── 3. Mel-спектрограмма для каждого сегмента ────────
         for i in range(num_segments):
-            seg = audio[i * segment_len : (i + 1) * segment_len]
+            seg = audio[i * segment_len: (i + 1) * segment_len]
 
             if cfg.use_mel:
-                # Mel-спектрограмма через librosa (оптимизировано, быстрее ручного цикла)
+                # Mel-спектрограмма через librosa
                 mel = librosa.feature.melspectrogram(
                     y=seg,
                     sr=sr,
@@ -82,7 +81,7 @@ class SpectrogramProcessor:
                 else:
                     spec = mel
             else:
-                # Сырой FFT (оставлен для совместимости, не рекомендуется)
+                # Сырой FFT
                 stft = librosa.stft(
                     seg,
                     n_fft=cfg.n_fft,
