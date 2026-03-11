@@ -104,12 +104,19 @@ def run(
     spec = load_audio_spectrogram(audio_path, conf)   # (N, F, T)
     print(f"Спектрограмма: {spec.shape}")
 
-    # Нормировка
+    # Нормировка + формирование тензора для энкодера
     mn, mx = spec.min(), spec.max()
     if mx - mn > 1e-6:
-        spec = 2.0 * (spec - mn) / (mx - mn) - 1.0
+        spec = (spec - mn) / (mx - mn)   # → [0, 1]
 
-    spec_tensor = torch.from_numpy(spec).unsqueeze(0).to(device)  # (1, N, F, T)
+    # Реплицируем 1 канал → 3 для ImageNet-нормировки (как в dataset.py)
+    _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+    _IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+    spec_3ch = np.stack([spec, spec, spec], axis=1)      # (N, 3, F, T)
+    spec_3ch = (spec_3ch - _IMAGENET_MEAN) / _IMAGENET_STD
+
+    # Энкодер ожидает (B, N, C, F, T)
+    spec_tensor = torch.from_numpy(spec_3ch).unsqueeze(0).to(device)  # (1, N, 3, F, T)
 
     # ── 2. Модель ────────────────────────────────────────────
     model = ScoreGenerationModel(
