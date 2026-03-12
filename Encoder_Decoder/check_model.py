@@ -2,7 +2,7 @@ import torch
 import sys
 from pathlib import Path
 
-ckpt_path = 'D:/model/Lesha/4/best_model.pt'
+ckpt_path = 'D:/model/Lesha/5/best_model.pt'
 ckpt = torch.load(ckpt_path, map_location='cpu')
 
 # last.pt — это словарь чекпоинта, а не сама модель
