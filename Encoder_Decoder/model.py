@@ -134,7 +134,7 @@ class SpectrogramEncoder(nn.Module):
         # Проекция → d_model
         self.proj = nn.Sequential(
             nn.Linear(cnn_out, d_model),
-            nn.GELU(),
+            nn.ReLU(),
             nn.LayerNorm(d_model),
         )
         self.dropout = nn.Dropout(dropout)
@@ -144,8 +144,8 @@ class SpectrogramEncoder(nn.Module):
         x: (B, 1, F, T)
         → (B, 1, d_model)  — один вектор на сэмпл, используется как memory декодера
         """
-        out = self.proj(self.cnn(x))  # (B, d_model)
-        out = self.dropout(out)
+        out = self.proj.forward(self.cnn.forward(x))  # (B, d_model)
+        out = self.dropout.forward(out)
         return out.unsqueeze(1)  # (B, 1, d_model)
 
 
@@ -155,7 +155,7 @@ class _ConvBlock(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
         self.bn = nn.BatchNorm2d(out_ch)
-        self.act = nn.GELU()
+        self.act = nn.ReLU()
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -184,7 +184,7 @@ class PositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(1) > self.pe.size(1):
             self._build(x.size(1) + 64)
-        return self.dropout(x + self.pe[:, : x.size(1)])
+        return self.dropout.forward(x + self.pe[:, : x.size(1)])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -235,15 +235,18 @@ class MusicTransformerDecoder(nn.Module):
 
     def forward(self, tgt, memory, tgt_key_padding_mask=None):
         tgt_len = tgt.size(1)
-        causal = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=tgt.device)
-        x = self.token_embedding(tgt) * math.sqrt(self.d_model)
-        x = self.pos_encoding(x)
-        x = self.transformer_decoder(
+        # dtype=bool чтобы совпадал с tgt_key_padding_mask — иначе UserWarning
+        causal = nn.Transformer.generate_square_subsequent_mask(
+            tgt_len, device=tgt.device, dtype=torch.bool
+        )
+        x = self.token_embedding.forward(tgt) * math.sqrt(self.d_model)
+        x = self.pos_encoding.forward(x)
+        x = self.transformer_decoder.forward(
             tgt=x, memory=memory,
             tgt_mask=causal,
             tgt_key_padding_mask=tgt_key_padding_mask,
         )
-        return self.output_proj(x)  # (B, tgt_len, vocab_size)
+        return self.output_proj.forward(x)  # (B, tgt_len, vocab_size)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -304,9 +307,9 @@ class ScoreGenerationModel(nn.Module):
             tgt_key_padding_mask=None,
             cnn_chunk: int = 0,  # оставлен для совместимости, не используется
     ) -> torch.Tensor:
-        memory = self.encoder(spectrograms)  # (B, 1, d_model)
-        return self.decoder(tgt=tgt, memory=memory,
-                            tgt_key_padding_mask=tgt_key_padding_mask)
+        memory = self.encoder.forward(spectrograms)  # (B, 1, d_model)
+        return self.decoder.forward(tgt=tgt, memory=memory,
+                                    tgt_key_padding_mask=tgt_key_padding_mask)
 
     @torch.no_grad()
     def generate(
@@ -320,11 +323,11 @@ class ScoreGenerationModel(nn.Module):
         from tokenizer import BOS_TOKEN, EOS_TOKEN
         self.eval()
         device = spectrograms.device
-        memory = self.encoder(spectrograms)
+        memory = self.encoder.forward(spectrograms)
         gen = torch.tensor([[BOS_TOKEN]], dtype=torch.long, device=device)
 
         for _ in range(max_len):
-            logits = self.decoder(tgt=gen, memory=memory)[:, -1, :] / max(temperature, 1e-8)
+            logits = self.decoder.forward(tgt=gen, memory=memory)[:, -1, :] / max(temperature, 1e-8)
             if top_k > 0:
                 v, _ = torch.topk(logits, top_k)
                 logits = logits.masked_fill(logits < v[:, -1:], float("-inf"))
