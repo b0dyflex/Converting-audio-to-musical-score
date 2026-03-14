@@ -6,3 +6,7 @@ midi_to_fft/__pycache__/
 *npy
 __pycache__/
 midi_to_fft/examples/*Identifier
+test_dataset/
+midi_trimmed/
+dataset/
+checkpoints/
