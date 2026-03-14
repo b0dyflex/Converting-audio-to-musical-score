@@ -60,36 +60,53 @@ from tokenizer import VOCAB_SIZE, PAD_TOKEN
 
 
 # ══════════════════════════════════════════════════════════════
-#  1. Энкодер спектрограмм
+#  1. CNN-энкодер спектрограммы
 # ══════════════════════════════════════════════════════════════
 class SpectrogramEncoder(nn.Module):
     """
-    Два режима:
-    pretrained=True  — ResNet18 с весами ImageNet, вход (B*N, 3, F, T)
-    pretrained=False — лёгкий кастомный CNN,      вход (B*N, 1, F, T)
+    Принимает: (B, 1, F, T)  — батч одноканальных Mel-спектрограмм
+    Возвращает: (B, 1, d_model)  — закодированное представление (memory для декодера)
 
-    Выход обоих вариантов: (B, N, d_model)
+    pretrained=True:
+        ResNet18, первый слой адаптирован под 1 канал путём усреднения весов.
+        Остальные слои — предобученные веса ImageNet.
+
+    pretrained=False:
+        Лёгкий кастомный CNN с нуля.
     """
 
     def __init__(
             self,
             d_model: int = 256,
-            num_encoder_layers: int = 1,
-            nhead: int = 8,
             dropout: float = 0.1,
             pretrained: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
-        self.pretrained = pretrained
 
         if pretrained:
-            # ── Предобученный ResNet18 ────────────────────────
-            weights = tv_models.ResNet18_Weights.DEFAULT
-            backbone = tv_models.resnet18(weights=weights)
-            # Убираем финальный классификатор
-            self.backbone = nn.Sequential(
-                backbone.conv1,  # ожидает 3 канала
+            # ── ResNet18 с адаптированным первым слоем ────────
+            backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
+
+            # Оригинальный первый слой: Conv2d(3, 64, kernel=7, stride=2, padding=3)
+            orig_conv = backbone.conv1
+            orig_weight = orig_conv.weight.data  # (64, 3, 7, 7)
+
+            # Новый слой: 1 входной канал, веса = среднее по 3 каналам
+            new_conv = nn.Conv2d(
+                in_channels=1,
+                out_channels=orig_conv.out_channels,
+                kernel_size=orig_conv.kernel_size,
+                stride=orig_conv.stride,
+                padding=orig_conv.padding,
+                bias=False,
+            )
+            new_conv.weight.data = orig_weight.mean(dim=1, keepdim=True)  # (64, 1, 7, 7)
+            backbone.conv1 = new_conv
+
+            # Убираем финальный FC-классификатор
+            self.cnn = nn.Sequential(
+                backbone.conv1,
                 backbone.bn1,
                 backbone.relu,
                 backbone.maxpool,
@@ -97,17 +114,18 @@ class SpectrogramEncoder(nn.Module):
                 backbone.layer2,
                 backbone.layer3,
                 backbone.layer4,
-                backbone.avgpool,  # → (B*N, 512, 1, 1)
-                nn.Flatten(),  # → (B*N, 512)
+                backbone.avgpool,  # → (B, 512, 1, 1)
+                nn.Flatten(),  # → (B, 512)
             )
             cnn_out = 512
+
         else:
             # ── Лёгкий кастомный CNN ──────────────────────────
-            self.backbone = nn.Sequential(
+            self.cnn = nn.Sequential(
                 _ConvBlock(1, 32, stride=2),
                 _ConvBlock(32, 64, stride=2),
                 _ConvBlock(64, 128, stride=2),
-                _ConvBlock(128, 256, stride=2, depthwise=True),
+                _ConvBlock(128, 256, stride=2),
                 nn.AdaptiveAvgPool2d((1, 1)),
                 nn.Flatten(),
             )
@@ -119,57 +137,23 @@ class SpectrogramEncoder(nn.Module):
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
+        self.dropout = nn.Dropout(dropout)
 
-        # Positional Encoding для временны́х сегментов
-        self.seg_pos_enc = PositionalEncoding(d_model, max_len=2048, dropout=dropout)
-
-        # Лёгкий Transformer Encoder поверх CNN (1 слой — видит контекст соседних сегментов)
-        if num_encoder_layers > 0:
-            enc_layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=d_model * 2,
-                dropout=dropout,
-                batch_first=True,
-                norm_first=True,
-            )
-            self.transformer_enc = nn.TransformerEncoder(
-                enc_layer, num_layers=num_encoder_layers,
-                norm=nn.LayerNorm(d_model),
-            )
-        else:
-            self.transformer_enc = None
-
-    def forward(self, x: torch.Tensor, chunk: int = 16) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, N, C, F, T)  — C=3 если pretrained, C=1 если нет
+        x: (B, 1, F, T)
+        → (B, 1, d_model)  — один вектор на сэмпл, используется как memory декодера
         """
-        B, N, C, F, T = x.shape
-        # Обрабатываем CNN чанками для экономии пиковой памяти
-        x_flat = x.view(B * N, C, F, T)
-        outs = []
-        for i in range(0, B * N, chunk):
-            outs.append(self.proj(self.backbone(x_flat[i: i + chunk])))
-        x = torch.cat(outs, dim=0).view(B, N, self.d_model)  # (B, N, d_model)
-        x = self.seg_pos_enc(x)
-        if self.transformer_enc is not None:
-            x = self.transformer_enc(x)
-        return x
+        out = self.proj(self.cnn(x))  # (B, d_model)
+        out = self.dropout(out)
+        return out.unsqueeze(1)  # (B, 1, d_model)
 
 
-# ──────────────────────────────────────────────────────────────
-#  Блок кастомного CNN (используется только когда pretrained=False)
 # ──────────────────────────────────────────────────────────────
 class _ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=2, depthwise=False):
+    def __init__(self, in_ch, out_ch, stride=2):
         super().__init__()
-        if depthwise:
-            self.conv = nn.Sequential(
-                nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch, bias=False),
-                nn.Conv2d(in_ch, out_ch, 1, bias=False),
-            )
-        else:
-            self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
         self.bn = nn.BatchNorm2d(out_ch)
         self.act = nn.GELU()
 
@@ -181,7 +165,7 @@ class _ConvBlock(nn.Module):
 #  2. Positional Encoding
 # ══════════════════════════════════════════════════════════════
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 2048, dropout: float = 0.1):
+    def __init__(self, d_model: int, max_len: int = 1024, dropout: float = 0.1):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         self.d_model = d_model
@@ -190,8 +174,9 @@ class PositionalEncoding(nn.Module):
     def _build(self, max_len: int):
         pe = torch.zeros(max_len, self.d_model)
         pos = torch.arange(max_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, self.d_model, 2).float()
-                        * (-math.log(10000.0) / self.d_model))
+        div = torch.exp(
+            torch.arange(0, self.d_model, 2).float() * (-math.log(10000.0) / self.d_model)
+        )
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer("pe", pe.unsqueeze(0))
@@ -203,7 +188,7 @@ class PositionalEncoding(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  3. Transformer Decoder (Pre-LN + Weight Tying)
+#  3. Transformer Decoder
 # ══════════════════════════════════════════════════════════════
 class MusicTransformerDecoder(nn.Module):
     def __init__(
@@ -227,7 +212,7 @@ class MusicTransformerDecoder(nn.Module):
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True,
-            norm_first=True,  # Pre-LN: стабильнее градиенты
+            norm_first=True,
         )
         self.transformer_decoder = nn.TransformerDecoder(
             dec_layer, num_layers=num_layers,
@@ -235,7 +220,7 @@ class MusicTransformerDecoder(nn.Module):
         )
 
         self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
-        # Weight Tying — уменьшает переобучение, стандарт для LM
+        # Weight tying: эмбеддинг токенов и выходная проекция делят веса
         self.output_proj.weight = self.token_embedding.weight
 
         self._init_weights()
@@ -248,7 +233,7 @@ class MusicTransformerDecoder(nn.Module):
             elif "bias" in name:
                 nn.init.zeros_(p)
 
-    def forward(self, tgt, memory, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+    def forward(self, tgt, memory, tgt_key_padding_mask=None):
         tgt_len = tgt.size(1)
         causal = nn.Transformer.generate_square_subsequent_mask(tgt_len, device=tgt.device)
         x = self.token_embedding(tgt) * math.sqrt(self.d_model)
@@ -257,7 +242,6 @@ class MusicTransformerDecoder(nn.Module):
             tgt=x, memory=memory,
             tgt_mask=causal,
             tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask,
         )
         return self.output_proj(x)  # (B, tgt_len, vocab_size)
 
@@ -267,33 +251,34 @@ class MusicTransformerDecoder(nn.Module):
 # ══════════════════════════════════════════════════════════════
 class ScoreGenerationModel(nn.Module):
     """
-    ScoreGenerationModel v3.
+    ScoreGenerationModel v4.
 
-    ВАЖНО: если pretrained=True, dataset.py должен возвращать
-    спектрограммы формы (N, 3, F, T) с ImageNet-нормировкой.
-    Это управляется параметром imagenet_norm=True в MidiSpectrogramDataset.
+    Входной тензор спектрограммы: (B, 1, F, T)
+      B = batch_size
+      1 = один канал (Mel-спектрограмма, нормированная в [0,1])
+      F = 128 (mel-бины)
+      T = 216 (временные фреймы, 5 сек)
+
+    Более НЕ нужно: imagenet_norm, 3-канальная репликация, max_segments.
     """
 
     def __init__(
             self,
             d_model: int = 256,
             nhead: int = 8,
-            num_encoder_layers: int = 1,
             num_decoder_layers: int = 6,
             dim_feedforward: int = 1024,
             vocab_size: int = VOCAB_SIZE,
             max_seq_len: int = 256,
             dropout: float = 0.1,
-            pretrained_encoder: bool = True,  # ← по умолчанию теперь True
+            pretrained_encoder: bool = True,
+            # Параметры ниже оставлены для совместимости с train.py, не используются
+            num_encoder_layers: int = 0,
+            cnn_chunk: int = 0,
     ):
         super().__init__()
-
-        self.pretrained_encoder = pretrained_encoder
-
         self.encoder = SpectrogramEncoder(
             d_model=d_model,
-            num_encoder_layers=num_encoder_layers,
-            nhead=nhead,
             dropout=dropout,
             pretrained=pretrained_encoder,
         )
@@ -306,29 +291,27 @@ class ScoreGenerationModel(nn.Module):
             max_seq_len=max_seq_len,
             dropout=dropout,
         )
-
-        total = self.count_parameters()
         enc_p = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         dec_p = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-        mode = "pretrained ResNet18" if pretrained_encoder else "custom CNN"
-        print(f"ScoreGenerationModel v3 | {mode}")
-        print(f"  Encoder: {enc_p:,} params  |  Decoder: {dec_p:,} params  |  Total: {total:,}")
+        mode = "pretrained ResNet18 (1-ch)" if pretrained_encoder else "custom CNN"
+        print(f"ScoreGenerationModel v4 | {mode}")
+        print(f"  Encoder: {enc_p:,}  |  Decoder: {dec_p:,}  |  Total: {enc_p + dec_p:,}")
 
     def forward(
             self,
-            spectrograms: torch.Tensor,  # (B, N, C, F, T)
+            spectrograms: torch.Tensor,  # (B, 1, F, T)
             tgt: torch.Tensor,  # (B, tgt_len)
             tgt_key_padding_mask=None,
-            cnn_chunk: int = 8,
+            cnn_chunk: int = 0,  # оставлен для совместимости, не используется
     ) -> torch.Tensor:
-        memory = self.encoder(spectrograms, chunk=cnn_chunk)
+        memory = self.encoder(spectrograms)  # (B, 1, d_model)
         return self.decoder(tgt=tgt, memory=memory,
                             tgt_key_padding_mask=tgt_key_padding_mask)
 
     @torch.no_grad()
     def generate(
             self,
-            spectrograms: torch.Tensor,
+            spectrograms: torch.Tensor,  # (1, 1, F, T)
             max_len: int = 256,
             temperature: float = 1.0,
             top_k: int = 0,
@@ -342,55 +325,25 @@ class ScoreGenerationModel(nn.Module):
 
         for _ in range(max_len):
             logits = self.decoder(tgt=gen, memory=memory)[:, -1, :] / max(temperature, 1e-8)
-
             if top_k > 0:
-                vals, _ = torch.topk(logits, top_k)
-                logits = logits.masked_fill(logits < vals[:, -1:], float("-inf"))
-
+                v, _ = torch.topk(logits, top_k)
+                logits = logits.masked_fill(logits < v[:, -1:], float("-inf"))
             if top_p < 1.0:
-                sorted_l, sorted_i = torch.sort(logits, descending=True)
-                cum = torch.cumsum(torch.softmax(sorted_l, dim=-1), dim=-1)
-                sorted_l = sorted_l.masked_fill(
-                    cum - torch.softmax(sorted_l, dim=-1) > top_p, float("-inf"))
-                logits = torch.zeros_like(logits).scatter_(1, sorted_i, sorted_l)
-
+                sl, si = torch.sort(logits, descending=True)
+                cum = torch.cumsum(torch.softmax(sl, dim=-1), dim=-1)
+                sl = sl.masked_fill(cum - torch.softmax(sl, dim=-1) > top_p, float("-inf"))
+                logits = torch.zeros_like(logits).scatter_(1, si, sl)
             next_tok = torch.multinomial(torch.softmax(logits, dim=-1), 1)
             gen = torch.cat([gen, next_tok], dim=1)
             if next_tok.item() == EOS_TOKEN:
                 break
-
         return gen
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def get_param_groups(self, encoder_lr: float, decoder_lr: float) -> list:
-        """
-        Возвращает param_groups для AdamW с раздельными LR.
-        encoder_lr  — обычно 1e-4  (backbone дообучается медленно)
-        decoder_lr  — обычно 1e-3  (трансформер учится быстро)
-        """
         return [
             {"params": list(self.encoder.parameters()), "lr": encoder_lr},
             {"params": list(self.decoder.parameters()), "lr": decoder_lr},
         ]
-
-
-# ══════════════════════════════════════════════════════════════
-#  Готовые конфигурации
-# ══════════════════════════════════════════════════════════════
-def build_model(preset: str = "medium", pretrained: bool = True) -> ScoreGenerationModel:
-    """
-    "small"  — 4–6 ГБ GPU
-    "medium" — 8 ГБ GPU (рекомендуется)
-    "large"  — 16+ ГБ GPU
-    """
-    presets = {
-        "small": dict(d_model=128, nhead=4, num_encoder_layers=1,
-                      num_decoder_layers=4, dim_feedforward=512),
-        "medium": dict(d_model=256, nhead=8, num_encoder_layers=1,
-                       num_decoder_layers=6, dim_feedforward=1024),
-        "large": dict(d_model=512, nhead=8, num_encoder_layers=2,
-                      num_decoder_layers=8, dim_feedforward=2048),
-    }
-    return ScoreGenerationModel(**presets[preset], pretrained_encoder=pretrained)
