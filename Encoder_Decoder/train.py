@@ -63,12 +63,12 @@ CONFIG = dict(
     num_epochs=100,
 
     # LR (рекомендация научрука)
-    lr_decoder=5e-4,  # трансформер — высокий LR
+    lr_decoder=1e-3,  # трансформер — высокий LR
     lr_encoder=1e-4,  # backbone    — низкий LR
 
     weight_decay=1e-2,
-    warmup_steps=800,
-    grad_clip=0.5,
+    warmup_steps=400,
+    grad_clip=1.0,
     val_ratio=0.1,
     log_every=50,
     save_every=5,
