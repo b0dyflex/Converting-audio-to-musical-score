@@ -40,171 +40,202 @@ def plot_training(
     val_losses: list,
     save_dir: str,
     best_epoch: int = None,
+    best_loss: float = None,
 ):
     """
-    Строит и сохраняет графики обучения:
-      - Loss (train vs val) по эпохам
-      - Скорость снижения loss (дельта между эпохами)
-      - Скользящее среднее loss
-      - Сводная таблица метрик
+    Строит дашборд обучения и сохраняет training_plot.png в save_dir.
 
-    Сохраняет файл training_plot.png в save_dir.
+    Компоновка (2 строки × 3 столбца):
+      [0,0] Train loss по эпохам       [0,1] Train vs Val loss      [0,2] Лог-масштаб
+      [1,0] Δ Loss (бар-чарт)          [1,1] Скользящее среднее     [1,2] Карточка лучшей эпохи
     """
     try:
         import matplotlib
-        matplotlib.use("Agg")           # без GUI — работает везде
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.gridspec as gridspec
+        import matplotlib.patches as mpatches
         import numpy as np
     except ImportError:
         print("⚠ matplotlib не установлен. Установите: pip install matplotlib")
         return None
 
-    epochs = list(range(1, len(train_losses) + 1))
-    has_val = len(val_losses) > 0 and any(v > 0 for v in val_losses)
+    if not train_losses:
+        print("⚠ Нет данных для построения графика.")
+        return None
 
-    # Скользящее среднее (окно 3)
+    epochs    = list(range(1, len(train_losses) + 1))
+    has_val   = len(val_losses) > 0 and any(v > 0 for v in val_losses)
+    val_epochs = list(range(1, len(val_losses) + 1)) if has_val else []
+
+    # Вычисляем best_loss если не передан
+    if best_loss is None:
+        best_loss = min(val_losses) if has_val else min(train_losses)
+    if best_epoch is None:
+        if has_val:
+            best_epoch = int(np.argmin(val_losses)) + 1
+        else:
+            best_epoch = int(np.argmin(train_losses)) + 1
+
     def moving_avg(data, window=3):
         if len(data) < window:
-            return data
-        return np.convolve(data, np.ones(window) / window, mode="valid")
+            return list(data)
+        return list(np.convolve(data, np.ones(window) / window, mode="valid"))
 
-    # Дельта loss между эпохами
-    def deltas(data):
-        return [data[i] - data[i - 1] for i in range(1, len(data))]
+    # ── Палитра ──────────────────────────────────────────────────────
+    BG_MAIN   = "#0d0d1a"
+    BG_PANEL  = "#13132b"
+    BG_CARD   = "#1a1a3a"
+    C_TRAIN   = "#4fc3f7"   # голубой
+    C_VAL     = "#f48fb1"   # розовый
+    C_MA      = "#fff176"   # жёлтый (MA)
+    C_BEST    = "#69f0ae"   # зелёный (маркер best)
+    C_POS     = "#ef9a9a"   # красный (loss растёт)
+    C_NEG     = "#a5d6a7"   # зелёный (loss падает)
+    C_GRID    = "#1e1e3f"
+    C_TEXT    = "#e0e0e0"
+    C_MUTED   = "#888899"
 
-    fig = plt.figure(figsize=(16, 10))
-    fig.patch.set_facecolor("#0f0f1a")
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+    # ── Фигура ───────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(18, 10))
+    fig.patch.set_facecolor(BG_MAIN)
+    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.48, wspace=0.32,
+                            left=0.06, right=0.97, top=0.91, bottom=0.08)
 
-    COLOR_TRAIN = "#4fc3f7"   # голубой
-    COLOR_VAL   = "#f06292"   # розовый
-    COLOR_MA    = "#fff176"   # жёлтый
-    COLOR_GRID  = "#2a2a3e"
-    COLOR_TEXT  = "#e0e0e0"
+    def style(ax, title, xlabel="Эпоха", ylabel="Loss"):
+        ax.set_facecolor(BG_PANEL)
+        ax.set_title(title, color=C_TEXT, fontsize=10.5, pad=7, fontweight="bold")
+        ax.set_xlabel(xlabel, color=C_MUTED, fontsize=8.5)
+        ax.set_ylabel(ylabel, color=C_MUTED, fontsize=8.5)
+        ax.tick_params(colors=C_TEXT, labelsize=8)
+        ax.grid(color=C_GRID, linestyle="--", linewidth=0.6, alpha=0.8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(C_GRID)
 
-    ax_style = dict(facecolor="#1a1a2e", labelcolor=COLOR_TEXT, titlecolor=COLOR_TEXT)
+    def best_vline(ax):
+        if best_epoch:
+            ax.axvline(best_epoch, color=C_BEST, linestyle=":", linewidth=1.8,
+                       alpha=0.85, label=f"Best ep. {best_epoch}")
 
-    def style_ax(ax, title, xlabel="Эпоха", ylabel="Loss"):
-        ax.set_facecolor(ax_style["facecolor"])
-        ax.set_title(title, color=ax_style["titlecolor"], fontsize=11, pad=8, fontweight="bold")
-        ax.set_xlabel(xlabel, color=ax_style["labelcolor"], fontsize=9)
-        ax.set_ylabel(ylabel, color=ax_style["labelcolor"], fontsize=9)
-        ax.tick_params(colors=COLOR_TEXT, labelsize=8)
-        ax.grid(color=COLOR_GRID, linestyle="--", linewidth=0.6, alpha=0.7)
-        for spine in ax.spines.values():
-            spine.set_edgecolor(COLOR_GRID)
+    leg_kw = dict(fontsize=8, facecolor=BG_CARD, labelcolor=C_TEXT,
+                  edgecolor=C_GRID, framealpha=0.9)
 
-    # ------ 1. Train loss по эпохам ------
+    # ── [0,0] Train Loss ─────────────────────────────────────────────
     ax1 = fig.add_subplot(gs[0, 0])
-    style_ax(ax1, "Train Loss по эпохам")
-    ax1.plot(epochs, train_losses, color=COLOR_TRAIN, linewidth=2, marker="o",
-             markersize=4, label="Train loss")
-    if best_epoch:
-        ax1.axvline(best_epoch, color="#a5d6a7", linestyle=":", linewidth=1.5, label=f"Best (ep {best_epoch})")
-    ax1.legend(fontsize=8, facecolor="#1a1a2e", labelcolor=COLOR_TEXT)
+    style(ax1, "Train Loss")
+    ax1.plot(epochs, train_losses, color=C_TRAIN, linewidth=2,
+             marker="o", markersize=3.5, label="Train loss")
+    best_vline(ax1)
+    ax1.legend(**leg_kw)
 
-    # ------ 2. Train vs Val loss ------
+    # ── [0,1] Train vs Val ───────────────────────────────────────────
     ax2 = fig.add_subplot(gs[0, 1])
-    style_ax(ax2, "Train vs Validation Loss")
-    ax2.plot(epochs, train_losses, color=COLOR_TRAIN, linewidth=2, marker="o",
-             markersize=4, label="Train")
+    style(ax2, "Train vs Validation Loss")
+    ax2.plot(epochs, train_losses, color=C_TRAIN, linewidth=2,
+             marker="o", markersize=3.5, label="Train")
     if has_val:
-        val_epochs = list(range(1, len(val_losses) + 1))
-        ax2.plot(val_epochs, val_losses, color=COLOR_VAL, linewidth=2,
-                 marker="s", markersize=4, linestyle="--", label="Validation")
-    ax2.legend(fontsize=8, facecolor="#1a1a2e", labelcolor=COLOR_TEXT)
+        ax2.plot(val_epochs, val_losses, color=C_VAL, linewidth=2,
+                 marker="s", markersize=3.5, linestyle="--", label="Validation")
+    best_vline(ax2)
+    ax2.legend(**leg_kw)
 
-    # ------ 3. Скользящее среднее ------
+    # ── [0,2] Лог-масштаб ────────────────────────────────────────────
     ax3 = fig.add_subplot(gs[0, 2])
-    style_ax(ax3, "Скользящее среднее (окно=3)")
-    ax3.plot(epochs, train_losses, color=COLOR_TRAIN, linewidth=1,
-             alpha=0.4, label="Train (raw)")
-    ma = moving_avg(train_losses)
-    ma_epochs = list(range(2, len(ma) + 2))    # сдвиг из-за свёртки
-    ax3.plot(ma_epochs, ma, color=COLOR_MA, linewidth=2.5, label="MA train")
-    if has_val and len(val_losses) >= 3:
-        val_ma = moving_avg(val_losses)
-        val_ma_epochs = list(range(2, len(val_ma) + 2))
-        ax3.plot(val_ma_epochs, val_ma, color=COLOR_VAL, linewidth=2,
-                 linestyle="--", label="MA val")
-    ax3.legend(fontsize=8, facecolor="#1a1a2e", labelcolor=COLOR_TEXT)
-
-    # ------ 4. Дельта train loss ------
-    ax4 = fig.add_subplot(gs[1, 0])
-    style_ax(ax4, "Изменение Train Loss (Δ)", ylabel="ΔLoss")
-    d = deltas(train_losses)
-    d_epochs = epochs[1:]
-    colors_d = [COLOR_VAL if v > 0 else "#a5d6a7" for v in d]
-    ax4.bar(d_epochs, d, color=colors_d, alpha=0.8, width=0.6)
-    ax4.axhline(0, color=COLOR_TEXT, linewidth=0.8, linestyle="-")
-
-    # ------ 5. Log-scale loss ------
-    ax5 = fig.add_subplot(gs[1, 1])
-    style_ax(ax5, "Loss в логарифмическом масштабе", ylabel="Log(Loss)")
-    import numpy as np
+    style(ax3, "Loss (логарифмический масштаб)", ylabel="log(Loss)")
     log_train = np.log(np.clip(train_losses, 1e-9, None))
-    ax5.plot(epochs, log_train, color=COLOR_TRAIN, linewidth=2,
-             marker="o", markersize=4, label="log(Train)")
+    ax3.plot(epochs, log_train, color=C_TRAIN, linewidth=2,
+             marker="o", markersize=3.5, label="log(Train)")
     if has_val:
         log_val = np.log(np.clip(val_losses, 1e-9, None))
-        ax5.plot(val_epochs, log_val, color=COLOR_VAL, linewidth=2,
-                 marker="s", markersize=4, linestyle="--", label="log(Val)")
-    ax5.legend(fontsize=8, facecolor="#1a1a2e", labelcolor=COLOR_TEXT)
+        ax3.plot(val_epochs, log_val, color=C_VAL, linewidth=2,
+                 marker="s", markersize=3.5, linestyle="--", label="log(Val)")
+    best_vline(ax3)
+    ax3.legend(**leg_kw)
 
-    # ------ 6. Сводная таблица ------
+    # ── [1,0] Δ Loss ─────────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 0])
+    style(ax4, "Изменение Train Loss (Δ)", ylabel="ΔLoss")
+    d = [train_losses[i] - train_losses[i - 1] for i in range(1, len(train_losses))]
+    d_ep = epochs[1:]
+    bar_colors = [C_POS if v > 0 else C_NEG for v in d]
+    ax4.bar(d_ep, d, color=bar_colors, alpha=0.85, width=0.65)
+    ax4.axhline(0, color=C_TEXT, linewidth=0.8)
+    ax4.set_xlabel("Эпоха", color=C_MUTED, fontsize=8.5)
+    pos_p = mpatches.Patch(color=C_POS, label="Рост loss")
+    neg_p = mpatches.Patch(color=C_NEG, label="Снижение loss")
+    ax4.legend(handles=[pos_p, neg_p], **leg_kw)
+
+    # ── [1,1] Скользящее среднее ─────────────────────────────────────
+    ax5 = fig.add_subplot(gs[1, 1])
+    style(ax5, "Скользящее среднее (окно=3)")
+    ax5.plot(epochs, train_losses, color=C_TRAIN, linewidth=1,
+             alpha=0.35, label="Train (raw)")
+    ma = moving_avg(train_losses)
+    ma_ep = list(range(2, len(ma) + 2))
+    ax5.plot(ma_ep, ma, color=C_MA, linewidth=2.5, label="MA Train")
+    if has_val and len(val_losses) >= 3:
+        val_ma = moving_avg(val_losses)
+        val_ma_ep = list(range(2, len(val_ma) + 2))
+        ax5.plot(val_ma_ep, val_ma, color=C_VAL, linewidth=2,
+                 linestyle="--", label="MA Val")
+    best_vline(ax5)
+    ax5.legend(**leg_kw)
+
+    # ── [1,2] Карточка «Лучшая эпоха» ────────────────────────────────
     ax6 = fig.add_subplot(gs[1, 2])
-    ax6.set_facecolor("#1a1a2e")
+    ax6.set_facecolor(BG_CARD)
     ax6.axis("off")
-    ax6.set_title("Сводка обучения", color=COLOR_TEXT, fontsize=11,
-                  fontweight="bold", pad=8)
+    for sp in ax6.spines.values():
+        sp.set_edgecolor(C_GRID)
 
-    import numpy as np
-    rows = [
-        ["Эпох обучено",     str(len(train_losses))],
-        ["Min train loss",   f"{min(train_losses):.4f}"],
-        ["Max train loss",   f"{max(train_losses):.4f}"],
-        ["Финал train loss", f"{train_losses[-1]:.4f}"],
+    # Заголовок карточки
+    ax6.text(0.5, 0.96, "🏆  Лучшая эпоха", transform=ax6.transAxes,
+             ha="center", va="top", fontsize=12, fontweight="bold", color=C_BEST)
+
+    # Большой номер эпохи
+    ax6.text(0.5, 0.76, str(best_epoch), transform=ax6.transAxes,
+             ha="center", va="top", fontsize=38, fontweight="bold", color=C_BEST)
+
+    # Разделитель (axhline не принимает transform, рисуем через plot в осях)
+    ax6.plot([0.05, 0.95], [0.63, 0.63], color=C_GRID, linewidth=1,
+             transform=ax6.transAxes, clip_on=False)
+
+    # Метрики
+    metrics = [
+        ("Best loss",       f"{best_loss:.4f}"),
+        ("Min train loss",  f"{min(train_losses):.4f}"),
+        ("Final train",     f"{train_losses[-1]:.4f}"),
     ]
     if has_val:
-        rows += [
-            ["Min val loss",   f"{min(val_losses):.4f}"],
-            ["Финал val loss", f"{val_losses[-1]:.4f}"],
+        metrics += [
+            ("Min val loss",    f"{min(val_losses):.4f}"),
+            ("Final val",       f"{val_losses[-1]:.4f}"),
         ]
-    if best_epoch:
-        rows.append(["Best epoch", str(best_epoch)])
-
-    # Процент улучшения
     if len(train_losses) > 1:
-        improvement = (train_losses[0] - train_losses[-1]) / (train_losses[0] + 1e-9) * 100
-        rows.append(["Улучшение", f"{improvement:.1f}%"])
+        pct = (train_losses[0] - train_losses[-1]) / (abs(train_losses[0]) + 1e-9) * 100
+        metrics.append(("Улучшение",  f"{pct:+.1f}%"))
+    metrics.append(("Эпох обучено", str(len(train_losses))))
 
-    table = ax6.table(
-        cellText=rows,
-        colLabels=["Метрика", "Значение"],
-        cellLoc="center",
-        loc="center",
-        bbox=[0.05, 0.05, 0.9, 0.9],
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    for (row, col), cell in table.get_celld().items():
-        cell.set_facecolor("#12122a" if row % 2 == 0 else "#1e1e35")
-        cell.set_text_props(color=COLOR_TEXT)
-        cell.set_edgecolor(COLOR_GRID)
-        if row == 0:
-            cell.set_facecolor("#2a2a5e")
-            cell.set_text_props(color="#ffffff", fontweight="bold")
+    y_start = 0.60
+    row_h   = 0.085
+    for i, (label, value) in enumerate(metrics):
+        y = y_start - i * row_h
+        bg_color = "#111128" if i % 2 == 0 else BG_CARD
+        ax6.add_patch(plt.Rectangle((0.02, y - 0.04), 0.96, row_h,
+                                    transform=ax6.transAxes,
+                                    facecolor=bg_color, edgecolor="none", zorder=0))
+        ax6.text(0.08, y, label, transform=ax6.transAxes,
+                 ha="left", va="center", fontsize=9, color=C_MUTED)
+        ax6.text(0.92, y, value, transform=ax6.transAxes,
+                 ha="right", va="center", fontsize=9.5, fontweight="bold",
+                 color=C_BEST if "loss" in label.lower() or "%" in value else C_TEXT)
 
-    # Заголовок
-    fig.suptitle(
-        "Визуализация обучения модели Audio → Music",
-        color="#ffffff", fontsize=14, fontweight="bold", y=0.98
-    )
+    # ── Общий заголовок ───────────────────────────────────────────────
+    fig.suptitle("Audio → Music  ·  Визуализация обучения",
+                 color="#ffffff", fontsize=14, fontweight="bold", y=0.975)
 
-    # Сохраняем
     save_path = os.path.join(save_dir, "training_plot.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=BG_MAIN)
     plt.close(fig)
 
     print(f"✓ График обучения сохранён: {save_path}")
@@ -294,7 +325,7 @@ def train_on_data_dir(
     recursive: bool = False,
     batch_size: int = 4,
     epochs: int = None,       # None = автоподбор по размеру датасета
-    max_samples: int = 200,
+    max_samples: int = 5000,  # поднято с 200 — берём весь датасет
 ):
     """
     Обучает модель на папке с wav+midi парами.
@@ -359,7 +390,15 @@ def train_on_data_dir(
 
     dataset_size = len(train_loader.dataset)
     if epochs is None:
-        epochs = 10 if dataset_size < 50 else (15 if dataset_size < 200 else 20)
+        # Автоподбор: больше данных → больше эпох нужно для сходимости
+        if dataset_size < 100:
+            epochs = 30
+        elif dataset_size < 500:
+            epochs = 50
+        elif dataset_size < 2000:
+            epochs = 75
+        else:
+            epochs = 100
     print(f"\nДатасет: {dataset_size} пар | Эпох: {epochs}")
 
     # Размер модели по GPU
@@ -395,15 +434,10 @@ def train_on_data_dir(
     print(f"\n✓ Обучение завершено. Лучший loss: {best_loss:.4f}")
     print(f"✓ Модель сохранена: {best_model_path}")
 
-    # Определяем номер лучшей эпохи
+    # Берём best_epoch прямо из тренера (сохраняется при каждом улучшении)
     val_losses_list   = trainer.val_losses   if trainer.val_losses   else []
     train_losses_list = trainer.train_losses if trainer.train_losses else []
-
-    best_epoch = None
-    if val_losses_list:
-        best_epoch = int(val_losses_list.index(min(val_losses_list))) + 1
-    elif train_losses_list:
-        best_epoch = int(train_losses_list.index(min(train_losses_list))) + 1
+    best_epoch        = trainer.best_epoch   if trainer.best_epoch   else None
 
     # Строим и сохраняем графики
     print("\nГенерация графиков обучения...")
@@ -412,6 +446,7 @@ def train_on_data_dir(
         val_losses=val_losses_list,
         save_dir=save_dir,
         best_epoch=best_epoch,
+        best_loss=best_loss,
     )
 
     return best_model_path, midi_only
@@ -511,7 +546,7 @@ def run_pipeline(
     scale_factor: float = 0.8,
     batch_size: int = 4,
     epochs: int = None,
-    max_samples: int = 200,
+    max_samples: int = 5000,
 ) -> dict:
     """
     Универсальный пайплайн. Три сценария:
@@ -679,7 +714,7 @@ if __name__ == "__main__":
     parser.add_argument("--scale",          type=float, default=0.8, help="Масштаб страницы PDF (0.5–1.5)")
     parser.add_argument("--batch-size",     type=int,   default=4,   help="Размер батча при обучении")
     parser.add_argument("--epochs",         type=int,   default=None, help="Эпох обучения (по умолчанию автоподбор)")
-    parser.add_argument("--max-samples",    type=int,   default=200,  help="Максимум пар для обучения")
+    parser.add_argument("--max-samples",    type=int,   default=5000,  help="Максимум пар для обучения (0 = все)")
 
     args = parser.parse_args()
 

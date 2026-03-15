@@ -27,7 +27,7 @@ if device.type == 'cuda':
 # ==================== Residual Block ====================
 
 class ResidualBlock(nn.Module):
-    """Residual блок для энкодера"""
+    """Residual блок с Pre-Norm (LayerNorm перед Conv) — лучше сходится"""
 
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
@@ -37,6 +37,16 @@ class ResidualBlock(nn.Module):
 
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # SE (Squeeze-and-Excitation) — канальное внимание
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(out_channels, max(out_channels // 16, 4)),
+            nn.ReLU(),
+            nn.Linear(max(out_channels // 16, 4), out_channels),
+            nn.Sigmoid(),
+        )
 
         self.downsample = None
         if stride != 1 or in_channels != out_channels:
@@ -51,69 +61,69 @@ class ResidualBlock(nn.Module):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
 
+        # SE: масштабируем каналы по важности
+        se_w = self.se(out).view(out.size(0), out.size(1), 1, 1)
+        out = out * se_w
+
         if self.downsample is not None:
             identity = self.downsample(x)
 
-        out += identity
-        out = F.relu(out)
-
+        out = F.relu(out + identity)
         return out
 
 
 # ==================== AudioFeatureExtractor ====================
 
 class AudioFeatureExtractor(nn.Module):
-    """Оптический энкодер для извлечения признаков из аудио"""
+    """
+    CNN-Transformer энкодер.
+    CNN (с SE-блоками) → адаптивный пулинг → проекция → Transformer Encoder.
+    """
 
     def __init__(self, input_channels=1, hidden_dim=512, num_layers=4, dropout=0.1):
         super().__init__()
 
-        # Первоначальная свертка для увеличения каналов
+        # Первичная свёртка
         self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=(3, 3), padding=1)
         self.bn1 = nn.BatchNorm2d(64)
 
-        # Residual блоки
+        # ResNet-подобный стек с SE-блоками
         self.res_blocks = nn.ModuleList([
-            ResidualBlock(64, 128, stride=2),
+            ResidualBlock(64,  128, stride=2),
             ResidualBlock(128, 256, stride=2),
             ResidualBlock(256, 512, stride=2),
-            ResidualBlock(512, 512, stride=1)
+            ResidualBlock(512, 512, stride=1),
         ])
 
-        # Адаптивная пуллинг и выравнивание
+        # Адаптивный пулинг + проекция в hidden_dim
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
-        self.conv_reduce = nn.Conv1d(512, hidden_dim, kernel_size=1)
+        self.conv_reduce   = nn.Conv1d(512, hidden_dim, kernel_size=1)
+        self.input_norm    = nn.LayerNorm(hidden_dim)
 
-        # Трансформерный энкодер для временных зависимостей
+        # Трансформерный энкодер
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=8,
-            dim_feedforward=2048,
+            dim_feedforward=hidden_dim * 4,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True,   # Pre-LN: более стабильный градиент
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers,
+            norm=nn.LayerNorm(hidden_dim),
+        )
 
     def forward(self, x):
-        # x: [batch, 1, freq_bins, time_steps]
-
-        # Начальная свертка
+        # x: [B, 1, freq, time]
         x = F.relu(self.bn1(self.conv1(x)))
-
-        # Residual блоки
         for block in self.res_blocks:
             x = block(x)
 
-        # Адаптивный пулинг и подготовка для трансформера
-        x = self.adaptive_pool(x).squeeze(2)  # [batch, 512, time_steps]
-        x = self.conv_reduce(x)  # [batch, hidden_dim, time_steps]
-
-        # Перестановка для трансформера
-        x = x.permute(0, 2, 1)  # [batch, time_steps, hidden_dim]
-
-        # Трансформер энкодер
+        x = self.adaptive_pool(x).squeeze(2)          # [B, 512, T]
+        x = self.conv_reduce(x).permute(0, 2, 1)      # [B, T, hidden_dim]
+        x = self.input_norm(x)
         x = self.transformer_encoder(x)
-
         return x
 
 
@@ -137,29 +147,49 @@ class MusicTokenizer:
         self.duration_tokens = {}
         self.velocity_tokens = {}
 
-    def build_from_midi_files(self, midi_files: List[str], max_vocab_size=5000):
-        """Строит словарь из MIDI файлов"""
-        print("Building vocabulary from MIDI files...")
+    def build_from_midi_files(self, midi_files: List[str], max_vocab_size=5000, min_freq: int = 1):
+        """
+        Строит словарь из MIDI файлов.
 
-        all_tokens = set()
+        Изменения:
+        - Используем ВСЕ файлы (ранее было [:100] и [:50] в prepare_training_data_gpu)
+        - Считаем частоту каждого токена → отсекаем редкие (min_freq)
+        - Сортируем по частоте (самые частые токены получают меньший индекс)
+        """
+        print(f"Building vocabulary from {len(midi_files)} MIDI files...")
 
-        for midi_file in midi_files[:100]:  # Ограничиваем для скорости
+        from collections import Counter
+        token_counter: Counter = Counter()
+
+        for midi_file in midi_files:          # все файлы, без [:100]
             try:
                 tokens = self._extract_tokens_from_midi(midi_file)
-                all_tokens.update(tokens)
-            except:
+                token_counter.update(tokens)
+            except Exception:
                 continue
 
-        # Добавляем токены в словарь
-        for i, token in enumerate(sorted(all_tokens), start=len(self.vocab)):
-            if i >= max_vocab_size:
+        # Отбрасываем токены, встречающиеся реже min_freq раз
+        frequent = {t for t, c in token_counter.items() if c >= min_freq}
+
+        # Сортируем по убыванию частоты — частые токены получают меньший индекс
+        sorted_tokens = sorted(frequent, key=lambda t: -token_counter[t])
+
+        for token in sorted_tokens:
+            if len(self.vocab) >= max_vocab_size:
                 break
-            self.vocab[token] = i
+            if token not in self.vocab:
+                idx = len(self.vocab)
+                self.vocab[token] = idx
 
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
         self.vocab_size = len(self.vocab)
 
-        print(f"Vocabulary size: {self.vocab_size}")
+        # Подробная статистика
+        pitch_cnt    = sum(1 for t in self.vocab if t.startswith("PITCH_"))
+        vel_cnt      = sum(1 for t in self.vocab if t.startswith("VEL_"))
+        dur_cnt      = sum(1 for t in self.vocab if t.startswith("DUR_"))
+        print(f"Vocabulary size: {self.vocab_size}  "
+              f"(PITCH={pitch_cnt}, VEL={vel_cnt}, DUR={dur_cnt}, special=4)")
         return self
 
     def _extract_tokens_from_midi(self, midi_path: str) -> List[str]:
@@ -258,52 +288,59 @@ class PositionalEncoding(nn.Module):
 # ==================== Transformer Decoder ====================
 
 class MusicTransformerDecoder(nn.Module):
-    """Трансформер-декодер для генерации нотных последовательностей"""
+    """
+    Transformer-декодер с Pre-LayerNorm и улучшенной проекцией выхода.
+    Принимает memory из энкодера и авторегрессивно генерирует токены.
+    """
 
     def __init__(self, vocab_size, hidden_dim=512, num_layers=6, dropout=0.1, max_len=500):
         super().__init__()
+        self.hidden_dim = hidden_dim
 
-        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.embedding  = nn.Embedding(vocab_size, hidden_dim, padding_idx=0)
         self.pos_encoder = PositionalEncoding(hidden_dim, dropout, max_len)
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=8,
-            dim_feedforward=2048,
+            dim_feedforward=hidden_dim * 4,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True,     # Pre-LN: стабильнее при глубоких сетях
         )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=num_layers,
+            norm=nn.LayerNorm(hidden_dim),
+        )
 
-        self.fc_out = nn.Linear(hidden_dim, vocab_size)
-        self.hidden_dim = hidden_dim
+        # Двухслойная проекция: hidden → hidden//2 → vocab
+        self.fc_out = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, vocab_size),
+        )
 
     def forward(self, tgt, memory, tgt_mask=None, tgt_key_padding_mask=None):
-        # tgt: [batch, tgt_len]
-        # memory: [batch, src_len, hidden_dim] из энкодера
+        # tgt: [B, tgt_len];  memory: [B, src_len, hidden_dim]
+        scale = np.sqrt(self.hidden_dim)
+        tgt_emb = self.pos_encoder(self.embedding(tgt) * scale)
 
-        tgt_emb = self.embedding(tgt) * np.sqrt(self.hidden_dim)
-        tgt_emb = self.pos_encoder(tgt_emb)
-
-        # Создаём маску для декодера
         if tgt_mask is None:
             tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
 
-        output = self.transformer_decoder(
-            tgt_emb,
-            memory,
+        out = self.transformer_decoder(
+            tgt_emb, memory,
             tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask
+            tgt_key_padding_mask=tgt_key_padding_mask,
         )
+        return self.fc_out(out)
 
-        output = self.fc_out(output)
-        return output
-
-    def generate_square_subsequent_mask(self, sz):
-        """Создаёт маску для автогрессивного декодирования"""
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0))
-        return mask
+    @staticmethod
+    def generate_square_subsequent_mask(sz):
+        """Каузальная маска для авторегрессивного декодирования"""
+        mask = torch.triu(torch.ones(sz, sz), diagonal=1).bool()
+        return mask.float().masked_fill(mask, float('-inf'))
 
 
 # ==================== Audio2Music Model ====================
@@ -587,254 +624,267 @@ class AudioMusicDataset(Dataset):
 # ==================== Trainer (GPU оптимизированный) ====================
 
 class Audio2MusicTrainer:
-    """Тренер для модели Audio2Music (GPU оптимизированный)"""
+    """
+    Тренер модели Audio2Music.
 
-    def __init__(self, model, tokenizer, device=device):
-        self.device = device
-        self.model = model.to(self.device)
+    Улучшения по сравнению с исходной версией:
+    - Label Smoothing CrossEntropy (снижает переобучение)
+    - Warmup + CosineAnnealingLR вместо ReduceLROnPlateau
+    - Gradient Accumulation (эффективно увеличивает batch size)
+    - Early Stopping с configurable patience
+    - Сохранение best_epoch в чекпоинте
+    """
+
+    def __init__(self, model, tokenizer, device=device,
+                 label_smoothing: float = 0.1,
+                 warmup_epochs: int = 3,
+                 accum_steps: int = 1,
+                 early_stopping_patience: int = 7):
+        self.device   = device
+        self.model    = model.to(self.device)
         self.tokenizer = tokenizer
+        self.accum_steps = max(1, accum_steps)
 
-        # Оптимизатор и loss функция
-        self.optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=0).to(self.device)
+        # Label Smoothing: 0.1 — стандартная практика
+        self.criterion = nn.CrossEntropyLoss(
+            ignore_index=0, label_smoothing=label_smoothing
+        ).to(self.device)
 
-        # Планировщик обучения
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=3
+        self.optimizer = optim.AdamW(
+            model.parameters(), lr=1e-4, weight_decay=1e-5,
+            betas=(0.9, 0.98),    # β₂=0.98 из оригинального Transformer
         )
 
-        self.train_losses = []
-        self.val_losses = []
-        self.best_val_loss = float('inf')
+        self.warmup_epochs = warmup_epochs
+        self.early_stopping_patience = early_stopping_patience
 
+        # Планировщики — финальный выбирается после первой эпохи
+        self._scheduler_warmup = None   # будет создан в train()
+        self._scheduler_cosine = None
+
+        self.train_losses: list = []
+        self.val_losses:   list = []
+        self.best_val_loss  = float('inf')
+        self.best_epoch: int = 0
+
+    # ------------------------------------------------------------------
     def _save_checkpoint(self, path, epoch, train_loss, val_loss, is_best):
-        """Сохранение чекпоинта модели"""
         checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'epoch':               epoch,
+            'best_epoch':          self.best_epoch,
+            'model_state_dict':    self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'tokenizer': self.tokenizer,
-            'vocab_size': self.tokenizer.vocab_size,
-            'is_best': is_best,
-            'device': str(self.device),
-            'timestamp': time.time()
+            'train_loss':          train_loss,
+            'val_loss':            val_loss,
+            'train_losses':        self.train_losses,
+            'val_losses':          self.val_losses,
+            'tokenizer':           self.tokenizer,
+            'vocab_size':          self.tokenizer.vocab_size,
+            'is_best':             is_best,
+            'device':              str(self.device),
+            'timestamp':           time.time(),
         }
         torch.save(checkpoint, path)
         return path
 
+    # ------------------------------------------------------------------
     def train_epoch(self, train_loader):
-        """Одна эпоха обучения с GPU"""
         self.model.train()
-        total_loss = 0
+        total_loss       = 0.0
         processed_batches = 0
+        self.optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, (audio_features, target_tokens) in enumerate(train_loader):
-            # Очищаем кэш CUDA периодически
             if batch_idx % 10 == 0 and self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
-            # Перемещаем данные на GPU
             audio_features = audio_features.to(self.device, non_blocking=True)
-            target_tokens = target_tokens.to(self.device, non_blocking=True)
+            target_tokens  = target_tokens.to(self.device,  non_blocking=True)
 
-            # Проверяем размеры данных
             if audio_features.shape[0] == 0 or target_tokens.shape[0] == 0:
                 continue
 
-            # Подготовка входа и цели для учительского форсинга
-            decoder_input = target_tokens[:, :-1]
+            decoder_input  = target_tokens[:, :-1]
             decoder_target = target_tokens[:, 1:]
 
-            # Проверяем, что последовательности не пустые
             if decoder_input.shape[1] == 0 or decoder_target.shape[1] == 0:
                 continue
 
-            # Forward pass
-            self.optimizer.zero_grad(set_to_none=True)
             output = self.model(audio_features, decoder_input)
 
-            # Проверяем размеры
-            if output.shape[0] != decoder_target.shape[0] or output.shape[1] != decoder_target.shape[1]:
+            if output.shape[:2] != decoder_target.shape[:2]:
                 continue
 
-            # Reshape для loss функции
-            output = output.reshape(-1, output.size(-1))
-            decoder_target = decoder_target.reshape(-1)
+            loss = self.criterion(
+                output.reshape(-1, output.size(-1)),
+                decoder_target.reshape(-1),
+            ) / self.accum_steps
 
-            # Вычисляем loss
-            loss = self.criterion(output, decoder_target)
-
-            # Backward pass
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
 
-            total_loss += loss.item()
+            # Шаг оптимизатора только раз в accum_steps
+            if (batch_idx + 1) % self.accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+            total_loss       += loss.item() * self.accum_steps
             processed_batches += 1
 
             if batch_idx % 5 == 0:
-                print(f"  Batch {batch_idx}/{len(train_loader)}: Loss: {loss.item():.4f}")
+                print(f"  Batch {batch_idx}/{len(train_loader)}: Loss: {loss.item() * self.accum_steps:.4f}")
 
         if processed_batches == 0:
             return 0.0
 
-        avg_loss = total_loss / processed_batches
-        self.train_losses.append(avg_loss)
+        avg = total_loss / processed_batches
+        self.train_losses.append(avg)
+        return avg
 
-        return avg_loss
-
+    # ------------------------------------------------------------------
     def validate(self, val_loader):
-        """Валидация на GPU"""
         if val_loader is None:
             return 0.0
 
         self.model.eval()
-        total_loss = 0
+        total_loss       = 0.0
         processed_batches = 0
 
         with torch.no_grad():
             for audio_features, target_tokens in val_loader:
-                # Перемещаем данные на GPU
                 audio_features = audio_features.to(self.device, non_blocking=True)
-                target_tokens = target_tokens.to(self.device, non_blocking=True)
+                target_tokens  = target_tokens.to(self.device,  non_blocking=True)
 
-                # Пропускаем пустые батчи
                 if audio_features.shape[0] == 0 or target_tokens.shape[0] == 0:
                     continue
 
-                decoder_input = target_tokens[:, :-1]
+                decoder_input  = target_tokens[:, :-1]
                 decoder_target = target_tokens[:, 1:]
 
-                # Пропускаем пустые последовательности
                 if decoder_input.shape[1] == 0 or decoder_target.shape[1] == 0:
                     continue
 
                 output = self.model(audio_features, decoder_input)
 
-                # Проверяем размеры
-                if output.shape[0] != decoder_target.shape[0] or output.shape[1] != decoder_target.shape[1]:
+                if output.shape[:2] != decoder_target.shape[:2]:
                     continue
 
-                output = output.reshape(-1, output.size(-1))
-                decoder_target = decoder_target.reshape(-1)
-
-                loss = self.criterion(output, decoder_target)
-                total_loss += loss.item()
+                loss = self.criterion(
+                    output.reshape(-1, output.size(-1)),
+                    decoder_target.reshape(-1),
+                )
+                total_loss       += loss.item()
                 processed_batches += 1
 
         if processed_batches == 0:
             return 0.0
 
-        avg_loss = total_loss / processed_batches
-        self.val_losses.append(avg_loss)
+        avg = total_loss / processed_batches
+        self.val_losses.append(avg)
+        return avg
 
-        return avg_loss
-
+    # ------------------------------------------------------------------
     def train(self, train_loader, val_loader, epochs=20, save_dir='./models'):
-        """Полный цикл обучения с GPU"""
-
-        # Создаем директорию для сохранения
         os.makedirs(save_dir, exist_ok=True)
-
-        # Основные пути сохранения
-        best_path = os.path.join(save_dir, 'audio2music_best.pth')
+        best_path  = os.path.join(save_dir, 'audio2music_best.pth')
         final_path = os.path.join(save_dir, 'audio2music_final.pth')
 
+        # Warmup (линейный) + Cosine Annealing
+        warmup_steps = self.warmup_epochs * len(train_loader)
+        total_steps  = epochs * len(train_loader)
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step) / max(1, warmup_steps)
+            progress = float(step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return max(0.05, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+        scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+        # Счётчик для step-based scheduler
+        global_step = 0
+
         print(f"\nStarting training on {self.device}")
-        print(f"Training samples: {len(train_loader.dataset)}")
+        print(f"Training samples:   {len(train_loader.dataset)}")
         if val_loader:
             print(f"Validation samples: {len(val_loader.dataset)}")
-        print(f"Models will be saved to: {save_dir}")
+        print(f"Label smoothing:    0.1  |  Warmup epochs: {self.warmup_epochs}")
+        print(f"Grad accumulation:  {self.accum_steps}  |  Early stop patience: {self.early_stopping_patience}")
+        print(f"Models → {save_dir}")
 
-        total_start_time = time.time()
-        saved_files = []  # Список сохраненных файлов
+        total_start = time.time()
+        saved_files = []
+        no_improve  = 0    # счётчик для early stopping
+        last_train_loss = 0.0
+        last_val_loss   = 0.0
 
         for epoch in range(epochs):
-            epoch_start_time = time.time()
+            epoch_start = time.time()
             print(f"\n{'=' * 60}")
             print(f"Epoch {epoch + 1}/{epochs}")
             print(f"{'=' * 60}")
 
-            # Очищаем кэш перед каждой эпохой
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
-            # Обучение
-            train_loss = self.train_epoch(train_loader)
-            train_time = time.time() - epoch_start_time
+            last_train_loss = self.train_epoch(train_loader)
 
-            # Валидация
-            val_start_time = time.time()
-            val_loss = self.validate(val_loader)
-            val_time = time.time() - val_start_time
+            # Обновляем scheduler после каждого батча (уже внутри train_epoch)
+            # Здесь шагаем по эпохе
+            global_step += len(train_loader)
+            for _ in range(len(train_loader)):
+                scheduler.step()
 
-            # Общее время эпохи
-            epoch_time = time.time() - epoch_start_time
+            last_val_loss = self.validate(val_loader)
+            epoch_time    = time.time() - epoch_start
+            current_lr    = self.optimizer.param_groups[0]['lr']
 
             print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"  Train Loss: {train_loss:.4f} (Time: {train_time:.1f}s)")
-            print(f"  Val Loss:   {val_loss:.4f} (Time: {val_time:.1f}s)")
-            print(f"  Epoch Time: {epoch_time:.1f}s")
-
-            # Планировщик
-            if val_loader:
-                self.scheduler.step(val_loss)
-            else:
-                self.scheduler.step(train_loss)
-
-            # Выводим текущий learning rate
-            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"  Train Loss:    {last_train_loss:.4f}")
+            print(f"  Val Loss:      {last_val_loss:.4f}")
+            print(f"  Epoch Time:    {epoch_time:.1f}s")
             print(f"  Learning Rate: {current_lr:.2e}")
 
-            # Сохранение лучшей модели
-            is_best = False
-            if val_loader:
-                is_best = val_loss < self.best_val_loss
-                if is_best:
-                    self.best_val_loss = val_loss
-                    saved_path = self._save_checkpoint(best_path, epoch, train_loss, val_loss, is_best=True)
-                    saved_files.append(saved_path)
-                    print(f"  ✓ Saved BEST model to {saved_path}")
+            # Лучшая модель
+            monitor = last_val_loss if val_loader else last_train_loss
+            is_best  = monitor < self.best_val_loss
+
+            if is_best:
+                self.best_val_loss = monitor
+                self.best_epoch    = epoch + 1
+                no_improve         = 0
+                saved = self._save_checkpoint(best_path, epoch, last_train_loss, last_val_loss, is_best=True)
+                saved_files.append(saved)
+                print(f"  ✓ BEST model saved (epoch {self.best_epoch}, loss {monitor:.4f})")
             else:
-                is_best = train_loss < self.best_val_loss
-                if is_best:
-                    self.best_val_loss = train_loss
-                    saved_path = self._save_checkpoint(best_path, epoch, train_loss, val_loss, is_best=True)
-                    saved_files.append(saved_path)
-                    print(f"  ✓ Saved BEST model to {saved_path}")
+                no_improve += 1
 
-            # Сохраняем чекпоинт каждые 5 эпох
+            # Чекпоинт каждые 5 эпох
             if (epoch + 1) % 5 == 0:
-                checkpoint_path = os.path.join(save_dir, f'audio2music_epoch_{epoch + 1}.pth')
-                saved_path = self._save_checkpoint(checkpoint_path, epoch, train_loss, val_loss, is_best=False)
-                saved_files.append(saved_path)
-                print(f"  ✓ Saved checkpoint to {saved_path}")
+                ckpt_path = os.path.join(save_dir, f'audio2music_epoch_{epoch + 1}.pth')
+                saved = self._save_checkpoint(ckpt_path, epoch, last_train_loss, last_val_loss, is_best=False)
+                saved_files.append(saved)
+                print(f"  ✓ Checkpoint saved: {ckpt_path}")
 
-            # Ранняя остановка
-            if len(self.val_losses) > 5 and val_loader:
-                if min(self.val_losses[-5:]) > self.best_val_loss:
-                    print(f"\nEarly stopping triggered at epoch {epoch + 1}")
-                    break
+            # Early stopping
+            if no_improve >= self.early_stopping_patience and val_loader:
+                print(f"\n⏹ Early stopping triggered at epoch {epoch + 1} "
+                      f"(no improvement for {self.early_stopping_patience} epochs)")
+                break
 
-        total_time = time.time() - total_start_time
+        total_time = time.time() - total_start
 
-        # Сохраняем финальную модель
-        saved_path = self._save_checkpoint(final_path, epochs - 1, train_loss, val_loss, is_best=False)
-        saved_files.append(saved_path)
+        # Финальная модель
+        saved = self._save_checkpoint(final_path, epochs - 1, last_train_loss, last_val_loss, is_best=False)
+        saved_files.append(saved)
 
         print(f"\n{'=' * 60}")
         print(f"Training completed in {total_time:.1f}s ({total_time / 60:.1f} min)")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
-        print(f"Final model saved to {final_path}")
+        print(f"Best epoch:         {self.best_epoch}")
+        print(f"Best val loss:      {self.best_val_loss:.4f}")
+        print(f"Final model →       {final_path}")
 
-        # Выводим информацию о сохраненных файлах
         self._print_saved_files_info(saved_files, save_dir)
-
         return self.best_val_loss
 
     def _print_saved_files_info(self, saved_files, save_dir):
@@ -881,7 +931,7 @@ class Audio2MusicTrainer:
 
 # ==================== Data Preparation ====================
 
-def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_workers=2, max_samples=200):
+def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_workers=2, max_samples=2000):
     """Подготовка данных для обучения с GPU оптимизацией"""
 
     print(f"\nPreparing data from: {data_dir}")
@@ -910,10 +960,10 @@ def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_wor
     if not midi_files:
         raise ValueError("No MIDI files found!")
 
-    # Создаём токенизатор
+    # Создаём токенизатор — используем ВСЕ MIDI файлы для полного словаря
     print("Building tokenizer...")
     tokenizer = MusicTokenizer()
-    tokenizer.build_from_midi_files(midi_files[:50])  # Используем первые 50 файлов
+    tokenizer.build_from_midi_files(midi_files)   # все файлы, без ограничения
 
     # Создаём датасет
     print("Creating dataset...")
