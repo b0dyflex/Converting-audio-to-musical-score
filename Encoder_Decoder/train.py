@@ -25,6 +25,7 @@ train.py  v3
 import argparse
 import copy
 import csv
+import math
 import os
 import sys
 import time
@@ -74,6 +75,7 @@ CONFIG = dict(
     save_every=5,
     use_ema=True,
     ema_decay=0.999,
+    reset_optimizer=False,  # True = загрузить best_model.pt и сбросить оптимизатор
 )
 
 
@@ -240,7 +242,11 @@ def train(cfg: dict):
     start_epoch = 0
     best_val_loss = float("inf")
     ckpt_path = out_dir / "last.pt"
-    if ckpt_path.exists():
+    best_path = out_dir / "best_model.pt"
+    reset_optimizer = cfg.get("reset_optimizer", False)
+
+    if ckpt_path.exists() and not reset_optimizer:
+        # Обычное продолжение — загружаем всё
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -250,6 +256,18 @@ def train(cfg: dict):
         if ema and "ema" in ckpt:
             ema.shadow.load_state_dict(ckpt["ema"])
         print(f"Возобновление с эпохи {start_epoch} (best={best_val_loss:.4f})")
+    elif best_path.exists() and reset_optimizer:
+        # Сброс оптимизатора: берём лучшие веса, LR и планировщик — новые
+        weights = torch.load(best_path, map_location=device)
+        model.load_state_dict(weights)
+        if ema:
+            ema.shadow.load_state_dict(weights)
+        start_epoch = 0
+        best_val_loss = float("inf")
+        print(f"Загружены лучшие веса из best_model.pt")
+        print(f"Оптимизатор СБРОШЕН: lr_dec={cfg['lr_decoder']:.0e}  warmup={cfg['warmup_steps']}")
+    else:
+        print("Чекпоинт не найден — обучение с нуля")
 
     # ── Цикл ─────────────────────────────────────────────────
     model.train()
@@ -257,6 +275,7 @@ def train(cfg: dict):
 
     for epoch in range(start_epoch, cfg["num_epochs"]):
         ep_loss, ep_acc = 0.0, 0.0
+        ep_valid_steps = 0  # считаем только конечные (не nan) шаги
         t0 = time.time()
 
         for step_idx, batch in enumerate(train_loader):
@@ -264,10 +283,15 @@ def train(cfg: dict):
                 model, batch, criterion, scaler, device,
                 cfg["accum_steps"], step_idx,
             )
-            ep_loss += loss
-            ep_acc += acc
+            if math.isfinite(loss):
+                ep_loss += loss
+                ep_acc += acc
+                ep_valid_steps += 1
+            else:
+                # nan/inf — сбрасываем накопленные градиенты и идём дальше
+                optimizer.zero_grad()
 
-            if do_update:
+            if do_update and math.isfinite(loss):
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
                 scaler.step(optimizer)
@@ -276,6 +300,9 @@ def train(cfg: dict):
                 scheduler.step()
                 if ema:
                     ema.update(model)
+            elif do_update:
+                scaler.update()
+                optimizer.zero_grad()
 
             if (step_idx + 1) % cfg["log_every"] == 0:
                 lr_dec = optimizer.param_groups[1]["lr"]
@@ -285,8 +312,9 @@ def train(cfg: dict):
                       f"loss={loss:.4f}  acc={acc:.3f}  "
                       f"lr_dec={lr_dec:.2e}  lr_enc={lr_enc:.2e}")
 
-        avg_loss = ep_loss / len(train_loader)
-        avg_acc = ep_acc / len(train_loader)
+        n_steps = max(1, ep_valid_steps)
+        avg_loss = ep_loss / n_steps
+        avg_acc = ep_acc / n_steps
         val_model = ema.get_model() if ema else model
         val_loss, val_acc = validate(val_model, val_loader, criterion, device)
         elapsed = time.time() - t0
