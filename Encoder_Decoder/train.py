@@ -63,18 +63,19 @@ CONFIG = dict(
     accum_steps=2,  # эффективный batch = 16
     num_epochs=30,
 
-    # LR (рекомендация научрука)
-    lr_decoder=1e-3,  # трансформер — высокий LR
-    lr_encoder=1e-4,  # backbone    — низкий LR
+    # LR — снижен decoder LR для стабильности на больших данных
+    lr_decoder=3e-4,  # было 1e-3, уменьшено для борьбы с gradient explosion
+    lr_encoder=1e-4,  # backbone — низкий LR
 
     weight_decay=1e-2,
-    warmup_steps=400,
-    grad_clip=1.0,
+    warmup_steps=1000,  # было 400, увеличено для более плавного старта
+    grad_clip=0.5,     # было 1.0, уменьшено для доп. стабильности
     val_ratio=0.1,
     log_every=50,
     save_every=5,
     use_ema=True,
     ema_decay=0.999,
+    use_spec_augment=True,  # SpecAugment — маскирование частот и времени
     reset_optimizer=False,  # True = загрузить best_model.pt и сбросить оптимизатор
 )
 
@@ -152,16 +153,56 @@ class MetricsLogger:
 
 
 # ══════════════════════════════════════════════════════════════
+#  SpecAugment — маскирование полос частот и времени
+# ══════════════════════════════════════════════════════════════
+def spec_augment(specs: torch.Tensor,
+                 freq_mask_param: int = 15,
+                 time_mask_param: int = 30,
+                 num_freq_masks: int = 2,
+                 num_time_masks: int = 2) -> torch.Tensor:
+    """
+    Применяет SpecAugment к батчу спектрограмм (B, 1, F, T).
+    Каждый сэмпл в батче получает независимые маски — улучшает обобщение.
+    """
+    specs = specs.clone()
+    B, C, F, T = specs.shape
+    for b in range(B):
+        for _ in range(num_freq_masks):
+            f = torch.randint(1, freq_mask_param + 1, ()).item()
+            f0 = torch.randint(0, max(1, F - f), ()).item()
+            specs[b, :, f0:f0 + f, :] = 0.0
+        for _ in range(num_time_masks):
+            t = torch.randint(1, time_mask_param + 1, ()).item()
+            t0 = torch.randint(0, max(1, T - t), ()).item()
+            specs[b, :, :, t0:t0 + t] = 0.0
+    return specs
+
+
+# ══════════════════════════════════════════════════════════════
 #  Шаг обучения
 # ══════════════════════════════════════════════════════════════
-def train_step(model, batch, criterion, scaler, device, accum_steps, step_idx):
+def train_step(model, batch, criterion, scaler, device, accum_steps, step_idx,
+               use_spec_augment: bool = False):
     specs, src, tgt, pad_mask = [t.to(device) for t in batch]
+
+    # SpecAugment применяется только при обучении
+    if use_spec_augment and model.training:
+        specs = spec_augment(specs)
+
     with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
         logits = model(specs, src, tgt_key_padding_mask=pad_mask)
         loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1)) / accum_steps
+
+    loss_val = loss.item() * accum_steps
+    do_update = (step_idx + 1) % accum_steps == 0
+
+    # ВАЖНО: проверяем NaN/Inf ДО backward, чтобы не накапливать NaN-градиенты
+    if not math.isfinite(loss_val):
+        return loss_val, 0.0, do_update, False
+
     scaler.scale(loss).backward()
     acc = accuracy_no_pad(logits.detach(), tgt)
-    return loss.item() * accum_steps, acc, (step_idx + 1) % accum_steps == 0
+    return loss_val, acc, do_update, True  # is_valid=True
 
 
 # ══════════════════════════════════════════════════════════════
@@ -272,44 +313,59 @@ def train(cfg: dict):
     # ── Цикл ─────────────────────────────────────────────────
     model.train()
     optimizer.zero_grad()
+    use_aug = cfg.get("use_spec_augment", False)
 
     for epoch in range(start_epoch, cfg["num_epochs"]):
         ep_loss, ep_acc = 0.0, 0.0
         ep_valid_steps = 0  # считаем только конечные (не nan) шаги
         t0 = time.time()
 
+        # Флаги для корректного отслеживания окна аккумуляции
+        nan_in_window = False       # был ли NaN хоть в одном шаге окна
+        had_backward_in_window = False  # был ли хоть один valid backward в окне
+
         for step_idx, batch in enumerate(train_loader):
-            loss, acc, do_update = train_step(
+            loss, acc, do_update, is_valid = train_step(
                 model, batch, criterion, scaler, device,
-                cfg["accum_steps"], step_idx,
+                cfg["accum_steps"], step_idx, use_aug,
             )
-            if math.isfinite(loss):
+            if is_valid:
                 ep_loss += loss
                 ep_acc += acc
                 ep_valid_steps += 1
+                had_backward_in_window = True
             else:
-                # nan/inf — сбрасываем накопленные градиенты и идём дальше
-                optimizer.zero_grad()
+                # NaN loss — backward НЕ вызван, помечаем окно как испорченное
+                nan_in_window = True
 
-            if do_update and math.isfinite(loss):
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-                scaler.step(optimizer)
-                scaler.update()
+            if do_update:
+                if had_backward_in_window and not nan_in_window:
+                    # Нормальный шаг оптимизатора
+                    scaler.unscale_(optimizer)
+                    grad_norm = nn.utils.clip_grad_norm_(
+                        model.parameters(), cfg["grad_clip"])
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    if ema:
+                        ema.update(model)
+                elif had_backward_in_window:
+                    # Было несколько valid backward, но один шаг был NaN —
+                    # пропускаем обновление, даём scaler уменьшить scale
+                    scaler.unscale_(optimizer)
+                    scaler.update()
+                # Сбрасываем градиенты и флаги окна
                 optimizer.zero_grad()
-                scheduler.step()
-                if ema:
-                    ema.update(model)
-            elif do_update:
-                scaler.update()
-                optimizer.zero_grad()
+                nan_in_window = False
+                had_backward_in_window = False
 
             if (step_idx + 1) % cfg["log_every"] == 0:
                 lr_dec = optimizer.param_groups[1]["lr"]
                 lr_enc = optimizer.param_groups[0]["lr"]
                 logger.log_step(epoch + 1, step_idx + 1, loss, acc, lr_dec)
+                status = "NaN!" if not is_valid else f"loss={loss:.4f}  acc={acc:.3f}"
                 print(f"  Ep {epoch + 1} step {step_idx + 1}/{len(train_loader)} | "
-                      f"loss={loss:.4f}  acc={acc:.3f}  "
+                      f"{status}  "
                       f"lr_dec={lr_dec:.2e}  lr_enc={lr_enc:.2e}")
 
         n_steps = max(1, ep_valid_steps)
