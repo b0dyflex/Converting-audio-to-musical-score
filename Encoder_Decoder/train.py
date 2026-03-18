@@ -60,7 +60,7 @@ CONFIG = dict(
     # Обучение
     batch_size=8,  # можно 8-16 теперь, т.к. N=1 на сэмпл
     accum_steps=2,  # эффективный batch = 16
-    num_epochs=100,
+    num_epochs=30,
 
     # LR (рекомендация научрука)
     lr_decoder=1e-3,  # трансформер — высокий LR
