@@ -54,7 +54,6 @@ ScoreGenerationModel  v3
 import math
 import torch
 import torch.nn as nn
-import torchvision.models as tv_models
 
 from tokenizer import VOCAB_SIZE, PAD_TOKEN
 
@@ -83,7 +82,13 @@ class SpectrogramEncoder(nn.Module):
         self.d_model = d_model
 
         if pretrained:
-            backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
+            # SWSL ResNet18 — обучен Facebook на 940М Instagram-изображениях
+            # (semi-weakly supervised), даёт лучшие признаки чем стандартный ImageNet
+            backbone = torch.hub.load(
+                "facebookresearch/semi-supervised-ImageNet1K-models",
+                "swsl_resnet18",
+                verbose=False,
+            )
 
             # Адаптируем первый слой: 3 канала → 1 канал (усредняем веса)
             orig_conv = backbone.conv1
@@ -289,7 +294,7 @@ class ScoreGenerationModel(nn.Module):
         )
         enc_p = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         dec_p = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-        mode = "pretrained ResNet18 (1-ch, seq)" if pretrained_encoder else "custom CNN (seq)"
+        mode = "SWSL ResNet18 (1-ch, seq)" if pretrained_encoder else "custom CNN (seq)"
         print(f"ScoreGenerationModel v5 | {mode}")
         print(f"  Encoder: {enc_p:,}  |  Decoder: {dec_p:,}  |  Total: {enc_p + dec_p:,}")
         print(f"  Memory sequence: 28 позиций (было 1) → cross-attention работает")
