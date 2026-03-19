@@ -308,7 +308,7 @@ def train(cfg: dict):
                 lr_dec = optimizer.param_groups[1]["lr"]
                 lr_enc = optimizer.param_groups[0]["lr"]
                 logger.log_step(epoch + 1, step_idx + 1, loss, acc, lr_dec)
-                print(f"  Ep {epoch + 1} step {step_idx + 1}/{len(train_loader)} | "
+                print(f"  Epoch {epoch + 1} step {step_idx + 1}/{len(train_loader)} | "
                       f"loss={loss:.4f}  acc={acc:.3f}  "
                       f"lr_dec={lr_dec:.2e}  lr_enc={lr_enc:.2e}")
 
@@ -331,7 +331,7 @@ def train(cfg: dict):
             best_val_loss = val_loss
             save_m = ema.get_model() if ema else model
             torch.save(save_m.state_dict(), out_dir / "best_model.pt")
-            print(f"  ✓ Лучшая модель (val_loss={val_loss:.4f})")
+            print(f"Лучшая модель (val_loss={val_loss:.4f})")
 
         if (epoch + 1) % cfg["save_every"] == 0:
             ckpt_data = {
