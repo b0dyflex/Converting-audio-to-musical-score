@@ -81,8 +81,8 @@ CONFIG = dict(
     num_epochs=30,
 
     # ── LR (СНИЖЕН × 10) ────────────────────────────────────
-    lr_decoder=3e-4,    # было 1e-3
-    lr_encoder=3e-5,    # было 1e-4
+    lr_decoder=1e-4,    # было 1e-3
+    lr_encoder=1e-5,    # было 1e-4
 
     weight_decay=1e-2,
     warmup_steps=400,
@@ -419,11 +419,10 @@ def train(cfg: dict):
                 ep_acc += acc
                 ep_valid_steps += 1
             else:
-                # ── NaN: немедленный сброс ────────────────────
+                # NaN: сброс градиентов, пропуск батча
                 ep_nan_count += 1
                 optimizer.zero_grad()
-                scaler.update()
-                continue  # пропускаем этот батч полностью
+                continue
 
             if do_update:
                 scaler.unscale_(optimizer)
