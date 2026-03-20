@@ -428,7 +428,7 @@ def hparam_search(dataset_dir: str, output_dir: str):
         # Человекочитаемое имя конфигурации
         hkeys     = list(HPARAM_GRID.keys())
         short_str = "  ".join(f"{k}={cfg[k]}" for k in hkeys)
-        derived   = (f"→ nhead={cfg['nhead']}  ffn={cfg['dim_feedforward']}  "
+        derived   = (f"-nhead={cfg['nhead']}  ffn={cfg['dim_feedforward']}  "
                      f"freq_bins={cfg['max_freq_bins']}  "
                      f"time_steps={cfg['max_time_steps']}  "
                      f"seq_len={cfg['max_seq_len']}")
@@ -446,7 +446,7 @@ def hparam_search(dataset_dir: str, output_dir: str):
 
         try:
             result = run_experiment(cfg, run_dir, device)
-            print(f"  ✓  best_val_loss={result['best_val_loss']:.4f}  "
+            print(f"  best_val_loss={result['best_val_loss']:.4f}  "
                   f"best_val_acc={result['best_val_acc']:.3f}  "
                   f"time={result['total_train_time_s']:.0f}s")
         except KeyboardInterrupt:

@@ -5,13 +5,13 @@ prepare_dataset.py
 
 Структура выходных данных:
     output_dir/
-        sample_000000/          ← сегмент 0 трека midi_001.mid  (0–5 сек)
+        sample_000000/          <-- сегмент 0 трека midi_001.mid  (0–5 сек)
             spectrogram.npy     — (n_mels, time_steps) float32
             tokens.npy          — (max_seq_len,) int64
             meta.json           — {midi_file, segment_idx, start_sec, end_sec, n_notes}
-        sample_000001/          ← сегмент 1 трека midi_001.mid  (5–10 сек)
+        sample_000001/          <-- сегмент 1 трека midi_001.mid  (5–10 сек)
             ...
-        sample_000012/          ← сегмент 0 трека midi_002.mid  (0–5 сек)
+        sample_000012/          <-- сегмент 0 трека midi_002.mid  (0–5 сек)
             ...
 
 Запуск:
@@ -165,7 +165,7 @@ def prepare(
         output_dir: str,
         soundfont_path: str,
         max_seq_len: int = 256,
-        min_notes: int = 1,
+        min_notes: int = 0,
         workers: int = 0,
         verify_only: bool = False,
 ):
@@ -242,7 +242,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--soundfont", required=True)
     parser.add_argument("--max_seq_len", type=int, default=256)
-    parser.add_argument("--min_notes", type=int, default=1)
+    parser.add_argument("--min_notes", type=int, default=0)
     parser.add_argument("--workers", type=int, default=0,
                         help="Число процессов (0 = авто: ядра CPU - 1)")
     parser.add_argument("--verify_only", action="store_true")

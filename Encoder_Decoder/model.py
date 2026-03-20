@@ -3,18 +3,18 @@ ScoreGenerationModel
 ====================
 Архитектура (см. схему):
 
-  [Аудио] → SpectrogramProcessor → (N, F, T)
+  [Аудио] -SpectrogramProcessor -(N, F, T)
       ↓
-  ConvEncoder (ResNet18)  →  Тензор [N, d_model]
+  ConvEncoder (ResNet18)  - Тензор [N, d_model]
       ↓ (память энкодера)
   TransformerDecoder
     └─ Output Embedding + PositionalEncoding
     └─ Masked Multi-Head Attention  (Add&Norm)
     └─ Multi-Head Attention         (Add&Norm)  ← cross-attention с энкодером
     └─ Feed Forward                 (Add&Norm)
-    └─ Linear → Softmax → Output Probabilities
+    └─ Linear -Softmax -Output Probabilities
       ↓
-  Последовательность токенов → Сгенерированная партитура
+  Последовательность токенов -Сгенерированная партитура
 
 Параметры по умолчанию:
   d_model      = 128   (размер эмбеддинга, совпадает с выходом энкодера)
@@ -48,7 +48,7 @@ ScoreGenerationModel  v3
 
 Параметры для 8 ГБ GPU (по умолчанию):
   d_model=256, nhead=8, 1 encoder слой, 6 decoder слоёв, FFN=1024
-  pretrained=True  → использует ImageNet backbone
+  pretrained=True  -использует ImageNet backbone
 """
 
 import math
@@ -68,9 +68,9 @@ class SpectrogramEncoder(nn.Module):
     Выход: (B, S, d_model) — последовательность из S=28 векторов (memory декодера)
 
     Для входа (B, 1, 128, 216):
-      ResNet18 layer4 → (B, 512, 4, 7)
-      reshape         → (B, 28, 512)
-      proj            → (B, 28, d_model)
+      ResNet18 layer4 -(B, 512, 4, 7)
+      reshape         -(B, 28, 512)
+      proj            -(B, 28, d_model)
     """
 
     def __init__(
@@ -85,7 +85,7 @@ class SpectrogramEncoder(nn.Module):
         if pretrained:
             backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
 
-            # Адаптируем первый слой: 3 канала → 1 канал (усредняем веса)
+            # Адаптируем первый слой: 3 канала -1 канал (усредняем веса)
             orig_conv = backbone.conv1
             new_conv = nn.Conv2d(
                 in_channels=1,
@@ -123,7 +123,7 @@ class SpectrogramEncoder(nn.Module):
             )
             cnn_out = 256
 
-        # Проекция каналов → d_model (применяется к каждой позиции)
+        # Проекция каналов -d_model (применяется к каждой позиции)
         self.proj = nn.Sequential(
             nn.Linear(cnn_out, d_model),
             nn.GELU(),
@@ -292,7 +292,7 @@ class ScoreGenerationModel(nn.Module):
         mode = "pretrained ResNet18 (1-ch, seq)" if pretrained_encoder else "custom CNN (seq)"
         print(f"ScoreGenerationModel v5 | {mode}")
         print(f"  Encoder: {enc_p:,}  |  Decoder: {dec_p:,}  |  Total: {enc_p + dec_p:,}")
-        print(f"  Memory sequence: 28 позиций (было 1) → cross-attention работает")
+        print(f"  Memory sequence: 28 позиций (было 1) -cross-attention работает")
 
     def forward(
             self,

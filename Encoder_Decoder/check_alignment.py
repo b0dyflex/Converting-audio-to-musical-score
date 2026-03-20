@@ -76,7 +76,7 @@ def text_report(midi_path: str, config: AudioConfig) -> None:
 
     print(f"\n{'=' * 70}")
     print(f"Файл:     {Path(midi_path).name}")
-    print(f"Длина:    {dur:.2f} сек  →  {n_seg} сегментов по {seg} сек")
+    print(f"Длина:    {dur:.2f} сек  - {n_seg} сегментов по {seg} сек")
     print(f"{'=' * 70}")
 
     for i in range(n_seg):

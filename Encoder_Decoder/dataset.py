@@ -1,23 +1,21 @@
 """
-MidiSpectrogramDataset
-=======================
-Датасет читает пары (spectrogram.npy, tokens.npy) из dataset_root.
-
-Нормировка спектрограммы:
-  audio_processor.py уже сохраняет значения в [0, 1] (из dB шкалы).
-  Если используется предобученный ResNet18 (imagenet_norm=True), датасет
-  дополнительно применяет ImageNet-нормировку: mean=[0.485, 0.456, 0.406],
-  std=[0.229, 0.224, 0.225] по трём каналам (канал реплицируется × 3).
+MidiSpectrogramDataset v2
+=========================
+Изменения по сравнению с v1:
+  + skip_silent: фильтрация полностью пустых сегментов (спектрограмма ≈ 0)
+  + silence_threshold: порог "пустоты" спектрограммы (по умолчанию 0.01)
+  + Статистика по пустым сегментам при инициализации
+  + Безопасная обработка: пустые сегменты не вызовут nan в loss
 
 Каждый sample содержит:
-  spectrogram.npy  → (n_mels, time_steps)   float32   [0, 1]
-  tokens.npy       → (max_seq_len,)          int64
+  spectrogram.npy  --> (n_mels, time_steps)   float32   [0, 1]
+  tokens.npy       --> (max_seq_len,)          int64
 
 Dataset возвращает кортеж:
-  spec       : FloatTensor (1, C, F, T)  — один сегмент (N=1)
-  src_tokens : LongTensor  (seq_len,)    — [BOS, t1, t2, ..., tN]
-  tgt_tokens : LongTensor  (seq_len,)    — [t1,  t2, ..., tN, EOS]
-  pad_mask   : BoolTensor  (seq_len,)    — True там где PAD
+  spec       : FloatTensor (1, F, T)  — один сегмент
+  src_tokens : LongTensor  (seq_len,) — [BOS, t1, t2, ..., tN]
+  tgt_tokens : LongTensor  (seq_len,) — [t1,  t2, ..., tN, EOS]
+  pad_mask   : BoolTensor  (seq_len,) — True там где PAD
 """
 
 from __future__ import annotations
@@ -38,37 +36,56 @@ class MidiSpectrogramDataset(Dataset):
             max_seq_len: int = 256,
             max_freq_bins: int = 128,
             max_time_steps: int = 216,
-            # Параметры ниже оставлены для совместимости с train.py
-            imagenet_norm: bool = False,  # больше не используется
-            max_segments: int = 0,  # больше не используется
+            skip_silent: bool = False,
+            silence_threshold: float = 0.01,
+            # Совместимость со старым train.py
+            imagenet_norm: bool = False,
+            max_segments: int = 0,
     ):
         self.root = Path(dataset_root)
         self.max_seq_len = max_seq_len
         self.max_freq_bins = max_freq_bins
         self.max_time_steps = max_time_steps
+        self.silence_threshold = silence_threshold
 
-        self.samples = sorted([
+        all_samples = sorted([
             d for d in self.root.iterdir()
             if d.is_dir()
                and (d / "spectrogram.npy").exists()
                and (d / "tokens.npy").exists()
         ])
-        if not self.samples:
+
+        if not all_samples:
             raise RuntimeError(
                 f"Нет данных в {self.root}.\n"
                 "Запустите prepare_dataset.py для создания датасета."
             )
 
-        # Проверка формата: v1 хранил (N, F, T), нужен (F, T)
-        probe = np.load(self.samples[0] / "spectrogram.npy", mmap_mode="r")
+        # Проверка формата
+        probe = np.load(all_samples[0] / "spectrogram.npy", mmap_mode="r")
         if probe.ndim == 3:
             raise RuntimeError(
                 "Датасет создан старой версией prepare_dataset.py.\n"
-                "Пересоздайте датасет: python prepare_dataset.py --midi_dir ... "
-                "--output_dir ... --soundfont ..."
+                "Пересоздайте датасет."
             )
 
-        print(f"Dataset v3: {len(self.samples)} сегментов")
+        # ── Фильтрация пустых сегментов ──────────────────────
+        if skip_silent:
+            self.samples = []
+            n_skipped = 0
+            for d in all_samples:
+                spec = np.load(d / "spectrogram.npy", mmap_mode="r")
+                # Считаем сегмент "пустым" если средняя энергия < порога
+                if spec.mean() < silence_threshold:
+                    n_skipped += 1
+                else:
+                    self.samples.append(d)
+            print(f"Dataset v2: {len(self.samples)} сегментов "
+                  f"(пропущено {n_skipped} пустых, порог={silence_threshold})")
+        else:
+            self.samples = all_samples
+            print(f"Dataset v2: {len(self.samples)} сегментов (без фильтрации)")
+
         print(f"  Форма спектрограммы: (1, {max_freq_bins}, {max_time_steps})")
         print(f"  Нормировка: [0, 1] (dB-шкала)")
 

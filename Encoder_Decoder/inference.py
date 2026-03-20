@@ -53,7 +53,7 @@ def tokens_to_midi(events, output_path: str, instrument_program: int = 0):
     pm = pretty_midi.PrettyMIDI()
     inst = pretty_midi.Instrument(program=instrument_program)
 
-    # Активные ноты: pitch → (start_time, velocity)
+    # Активные ноты: pitch -(start_time, velocity)
     active: dict[int, tuple[float, int]] = {}
     current_velocity = 64
 
@@ -107,9 +107,9 @@ def run(
     # Нормировка + формирование тензора для энкодера
     mn, mx = spec.min(), spec.max()
     if mx - mn > 1e-6:
-        spec = (spec - mn) / (mx - mn)   # → [0, 1]
+        spec = (spec - mn) / (mx - mn)   # -[0, 1]
 
-    # Реплицируем 1 канал → 3 для ImageNet-нормировки (как в dataset.py)
+    # Реплицируем 1 канал -3 для ImageNet-нормировки (как в dataset.py)
     _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
     _IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
     spec_3ch = np.stack([spec, spec, spec], axis=1)      # (N, 3, F, T)
