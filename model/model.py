@@ -804,6 +804,132 @@ class MaestroDataset(Dataset):
             return mel_t, token_t
 
 
+# ==================== MAESTRO Auto Dataset (через mirdata) ====================
+
+class MaestroAutoDataset(Dataset):
+    """
+    Датасет MAESTRO с автоматической загрузкой через mirdata.
+
+    Установка: pip install mirdata
+    При первом запуске скачивает MAESTRO (~120 GB) в data_home.
+    При повторных запусках использует кэш.
+
+    Использование:
+        dataset = MaestroAutoDataset(tokenizer, split='train')
+        # или с указанием папки сохранения:
+        dataset = MaestroAutoDataset(tokenizer, data_home='D:/datasets')
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        split: str = 'train',
+        data_home: str = None,
+        segment_len: float = 5.0,
+        sample_rate: int = 22050,
+        hop_length: int = 512,
+        max_token_len: int = 500,
+        download: bool = True,
+    ):
+        try:
+            import mirdata
+        except ImportError:
+            raise ImportError(
+                "Установите mirdata: pip install mirdata\n"
+                "Затем при первом запуске датасет скачается автоматически."
+            )
+
+        self.tokenizer     = tokenizer
+        self.split         = split
+        self.segment_len   = segment_len
+        self.sample_rate   = sample_rate
+        self.hop_length    = hop_length
+        self.max_token_len = max_token_len
+        self.fixed_time    = int(np.ceil(segment_len * sample_rate / hop_length)) + 1
+
+        # Инициализируем mirdata
+        kwargs = {'data_home': data_home} if data_home else {}
+        maestro = mirdata.initialize('maestro', **kwargs)
+
+        if download:
+            print("Проверка/загрузка MAESTRO через mirdata...")
+            maestro.download()
+
+        # Загружаем треки нужного split-а
+        all_tracks = maestro.load_tracks()
+        tracks = [t for t in all_tracks.values() if t.split == split]
+        print(f"MAESTRO [{split}]: {len(tracks)} записей")
+
+        # Нарезаем на сегменты
+        self.segments: List[Tuple[Path, Path, float]] = []
+        missing = 0
+
+        for track in tracks:
+            if not track.audio_path or not track.midi_path:
+                missing += 1
+                continue
+            audio_path = Path(track.audio_path)
+            midi_path  = Path(track.midi_path)
+            if not audio_path.exists() or not midi_path.exists():
+                missing += 1
+                continue
+
+            duration = float(track.duration)
+            t = 0.0
+            while t + segment_len <= duration:
+                self.segments.append((audio_path, midi_path, t))
+                t += segment_len
+
+        if missing:
+            print(f"  Пропущено {missing} треков (файлы не найдены)")
+        print(f"  Итого сегментов [{split}]: {len(self.segments)}")
+
+    def __len__(self) -> int:
+        return len(self.segments)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        audio_path, midi_path, t_start = self.segments[idx]
+        t_end = t_start + self.segment_len
+
+        try:
+            audio, sr = librosa.load(
+                str(audio_path),
+                sr=self.sample_rate,
+                offset=t_start,
+                duration=self.segment_len,
+                mono=True,
+            )
+
+            mel = librosa.feature.melspectrogram(
+                y=audio, sr=sr, n_fft=2048,
+                hop_length=self.hop_length, n_mels=128,
+            )
+            mel = librosa.power_to_db(mel, ref=np.max)
+            mel = (mel - mel.mean()) / (mel.std() + 1e-8)
+
+            mel_t = torch.FloatTensor(mel)
+            t = mel_t.shape[1]
+            if t >= self.fixed_time:
+                mel_t = mel_t[:, :self.fixed_time]
+            else:
+                mel_t = torch.cat([mel_t, torch.zeros(128, self.fixed_time - t)], dim=1)
+            mel_t = mel_t.unsqueeze(0)              # [1, 128, fixed_time]
+
+            token_ids = self.tokenizer.tokenize_midi_segment(str(midi_path), t_start, t_end)
+            token_t   = torch.LongTensor(token_ids)
+            if len(token_t) >= self.max_token_len:
+                token_t = token_t[:self.max_token_len]
+            else:
+                token_t = torch.cat([token_t, torch.zeros(self.max_token_len - len(token_t), dtype=torch.long)])
+
+            return mel_t, token_t
+
+        except Exception as e:
+            print(f"[MaestroAutoDataset] Ошибка idx={idx} t={t_start:.1f}s: {e}")
+            return (torch.zeros(1, 128, self.fixed_time),
+                    torch.zeros(self.max_token_len, dtype=torch.long))
+
+
 # ==================== Trainer (GPU оптимизированный) ====================
 
 class Audio2MusicTrainer:
@@ -1269,6 +1395,84 @@ def prepare_maestro_data(
         shuffle=False,
         num_workers=0,
         pin_memory=(device.type == 'cuda'),
+    ) if len(val_dataset) > 0 else None
+
+    return train_loader, val_loader, tokenizer
+
+
+def prepare_maestro_auto(
+    data_home: str = None,
+    batch_size: int = 8,
+    segment_len: float = 5.0,
+    tokenizer_path: Optional[str] = None,
+    download: bool = True,
+) -> Tuple[DataLoader, DataLoader, 'MusicTokenizer']:
+    """
+    Подготовка MAESTRO через mirdata — без ручного скачивания.
+
+    При первом вызове скачивает датасет автоматически (~120 GB).
+    При повторных — использует кэш.
+
+    Args:
+        data_home:      папка для хранения датасета (None → ~/.mirdata/maestro)
+        batch_size:     размер батча
+        segment_len:    длина сегмента, сек
+        tokenizer_path: путь для кэша токенизатора (.json)
+        download:       скачивать если не скачан (True)
+
+    Returns:
+        train_loader, val_loader, tokenizer
+
+    Пример:
+        train_loader, val_loader, tok = prepare_maestro_auto(
+            data_home='D:/datasets',
+            batch_size=8,
+        )
+    """
+    try:
+        import mirdata
+    except ImportError:
+        raise ImportError("Установите mirdata: pip install mirdata")
+
+    # ── Токенизатор ───────────────────────────────────────────────────────────
+    tokenizer = MusicTokenizer()
+
+    if tokenizer_path and os.path.exists(tokenizer_path):
+        tokenizer.load(tokenizer_path)
+        print(f"Токенизатор загружен из {tokenizer_path}  (vocab={tokenizer.vocab_size})")
+    else:
+        print("Строю токенизатор из MIDI файлов MAESTRO...")
+        kwargs = {'data_home': data_home} if data_home else {}
+        maestro = mirdata.initialize('maestro', **kwargs)
+        if download:
+            maestro.download()
+        tracks    = maestro.load_tracks()
+        midi_files = [t.midi_path for t in tracks.values() if t.midi_path]
+        tokenizer.build_from_midi_files(midi_files)
+        if tokenizer_path:
+            tokenizer.save(tokenizer_path)
+            print(f"Токенизатор сохранён в {tokenizer_path}")
+
+    # ── Датасеты ─────────────────────────────────────────────────────────────
+    train_dataset = MaestroAutoDataset(
+        tokenizer, split='train', data_home=data_home,
+        segment_len=segment_len, download=download,
+    )
+    val_dataset = MaestroAutoDataset(
+        tokenizer, split='validation', data_home=data_home,
+        segment_len=segment_len, download=download,
+    )
+
+    if len(train_dataset) == 0:
+        raise ValueError("Train dataset пустой. Проверьте загрузку датасета.")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=0, pin_memory=(device.type == 'cuda'),
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=0, pin_memory=(device.type == 'cuda'),
     ) if len(val_dataset) > 0 else None
 
     return train_loader, val_loader, tokenizer
