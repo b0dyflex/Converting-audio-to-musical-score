@@ -260,6 +260,44 @@ class MusicTokenizer:
         encoded = self.encode(['<SOS>'] + tokens + ['<EOS>'])
         return encoded
 
+    def tokenize_midi_segment(self, midi_path: str, t_start: float, t_end: float) -> List[int]:
+        """
+        Токенизирует только те ноты MIDI, которые начинаются в [t_start, t_end).
+        Используется для сегментации длинных записей (например, MAESTRO).
+        Возвращает: SOS + [PITCH_X, VEL_X, DUR_X, ...] + EOS (индексы)
+        """
+        tokens = []
+        try:
+            midi = pretty_midi.PrettyMIDI(midi_path)
+            for instrument in midi.instruments:
+                notes = sorted(
+                    [n for n in instrument.notes if t_start <= n.start < t_end],
+                    key=lambda n: n.start,
+                )
+                for note in notes:
+                    pitch_token = f"PITCH_{note.pitch}"
+                    vel_token   = f"VEL_{min(note.velocity // 10, 9)}"
+                    dur_token   = f"DUR_{self._quantize_duration(note.end - note.start)}"
+                    tokens.extend([pitch_token, vel_token, dur_token])
+        except Exception:
+            pass
+
+        return self.encode(['<SOS>'] + tokens + ['<EOS>'])
+
+    def save(self, path: str) -> None:
+        """Сохраняет словарь в JSON файл"""
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'vocab': self.vocab, 'vocab_size': self.vocab_size}, f, ensure_ascii=False)
+
+    def load(self, path: str) -> 'MusicTokenizer':
+        """Загружает словарь из JSON файла"""
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        self.vocab         = {k: int(v) for k, v in data['vocab'].items()}
+        self.reverse_vocab = {v: k for k, v in self.vocab.items()}
+        self.vocab_size    = data.get('vocab_size', len(self.vocab))
+        return self
+
 
 # ==================== Positional Encoding ====================
 
@@ -619,6 +657,151 @@ class AudioMusicDataset(Dataset):
 
     def __len__(self):
         return len(self.pairs)
+
+
+# ==================== MAESTRO Dataset ====================
+
+class MaestroDataset(Dataset):
+    """
+    Датасет для обучения на MAESTRO v3 (https://magenta.tensorflow.org/datasets/maestro).
+
+    Ожидаемая структура:
+        maestro-v3.0.0/
+        ├── maestro-v3.0.0.csv   ← метаданные с колонками: split, audio_filename,
+        │                            midi_filename, duration
+        ├── 2004/
+        │   ├── piece.midi
+        │   ├── piece.wav
+        │   └── ...
+        └── ...
+
+    Каждая длинная запись нарезается на сегменты по segment_len секунд.
+    Используется реальное аудио (WAV/FLAC), generate_audio_from_midi не нужен.
+    Официальные split-ы из CSV: 'train', 'validation', 'test'.
+    """
+
+    def __init__(
+        self,
+        maestro_root: str,
+        tokenizer,
+        split: str = 'train',
+        segment_len: float = 5.0,
+        sample_rate: int = 22050,
+        hop_length: int = 512,
+        max_token_len: int = 500,
+    ):
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ImportError("Установите pandas: pip install pandas")
+
+        self.root          = Path(maestro_root)
+        self.tokenizer     = tokenizer
+        self.split         = split
+        self.segment_len   = segment_len
+        self.sample_rate   = sample_rate
+        self.hop_length    = hop_length
+        self.max_token_len = max_token_len
+
+        # Длина мел-спектрограммы в кадрах для одного сегмента:
+        # ceil(segment_len * sr / hop_length) + 1
+        self.fixed_time = int(np.ceil(segment_len * sample_rate / hop_length)) + 1
+
+        # ── Загружаем метаданные ──────────────────────────────────────────────
+        csv_path = self.root / 'maestro-v3.0.0.csv'
+        if not csv_path.exists():
+            raise FileNotFoundError(
+                f"Файл метаданных не найден: {csv_path}\n"
+                "Скачайте датасет: https://magenta.tensorflow.org/datasets/maestro"
+            )
+
+        meta = pd.read_csv(csv_path)
+        if 'split' not in meta.columns:
+            raise ValueError("CSV не содержит колонку 'split'. Проверьте версию датасета.")
+
+        meta = meta[meta['split'] == split].reset_index(drop=True)
+        print(f"MAESTRO [{split}]: {len(meta)} записей")
+
+        # ── Нарезаем на сегменты ──────────────────────────────────────────────
+        # Элемент: (audio_path, midi_path, t_start)
+        self.segments: List[Tuple[Path, Path, float]] = []
+        missing = 0
+
+        for _, row in meta.iterrows():
+            audio_path = self.root / row['audio_filename']
+            midi_path  = self.root / row['midi_filename']
+
+            if not audio_path.exists() or not midi_path.exists():
+                missing += 1
+                continue
+
+            duration = float(row['duration'])
+            t = 0.0
+            while t + segment_len <= duration:
+                self.segments.append((audio_path, midi_path, t))
+                t += segment_len
+
+        if missing:
+            print(f"  Пропущено {missing} записей (файлы не найдены)")
+        print(f"  Итого сегментов [{split}]: {len(self.segments)}")
+
+    # ── Интерфейс Dataset ─────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return len(self.segments)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        audio_path, midi_path, t_start = self.segments[idx]
+        t_end = t_start + self.segment_len
+
+        try:
+            # ── Аудио → мел-спектрограмма ─────────────────────────────────────
+            audio, sr = librosa.load(
+                str(audio_path),
+                sr=self.sample_rate,
+                offset=t_start,
+                duration=self.segment_len,
+                mono=True,
+            )
+
+            mel = librosa.feature.melspectrogram(
+                y=audio,
+                sr=sr,
+                n_fft=2048,
+                hop_length=self.hop_length,
+                n_mels=128,
+            )
+            mel = librosa.power_to_db(mel, ref=np.max)
+            mel = (mel - mel.mean()) / (mel.std() + 1e-8)
+
+            mel_t = torch.FloatTensor(mel)          # [128, time]
+            t = mel_t.shape[1]
+            if t >= self.fixed_time:
+                mel_t = mel_t[:, :self.fixed_time]
+            else:
+                pad   = torch.zeros(128, self.fixed_time - t)
+                mel_t = torch.cat([mel_t, pad], dim=1)
+            mel_t = mel_t.unsqueeze(0)              # [1, 128, fixed_time]
+
+            # ── MIDI → токены ─────────────────────────────────────────────────
+            token_ids = self.tokenizer.tokenize_midi_segment(
+                str(midi_path), t_start, t_end
+            )
+            token_t = torch.LongTensor(token_ids)
+
+            if len(token_t) >= self.max_token_len:
+                token_t = token_t[:self.max_token_len]
+            else:
+                pad     = torch.zeros(self.max_token_len - len(token_t), dtype=torch.long)
+                token_t = torch.cat([token_t, pad])
+
+            return mel_t, token_t
+
+        except Exception as e:
+            print(f"[MaestroDataset] Ошибка idx={idx} ({audio_path.name} t={t_start:.1f}s): {e}")
+            mel_t   = torch.zeros(1, 128, self.fixed_time)
+            token_t = torch.zeros(self.max_token_len, dtype=torch.long)
+            return mel_t, token_t
 
 
 # ==================== Trainer (GPU оптимизированный) ====================
@@ -1021,6 +1204,72 @@ def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_wor
         )
     else:
         val_loader = None
+
+    return train_loader, val_loader, tokenizer
+
+
+def prepare_maestro_data(
+    maestro_root: str,
+    batch_size: int = 8,
+    segment_len: float = 5.0,
+    tokenizer_path: Optional[str] = None,
+) -> Tuple[DataLoader, DataLoader, 'MusicTokenizer']:
+    """
+    Подготовка данных MAESTRO для обучения.
+
+    Args:
+        maestro_root:   путь к папке maestro-v3.0.0/
+        batch_size:     размер батча
+        segment_len:    длина сегмента в секундах (5.0 по умолчанию)
+        tokenizer_path: путь к сохранённому токенизатору (.json).
+                        Если None — строится из MIDI файлов датасета.
+
+    Returns:
+        train_loader, val_loader, tokenizer
+    """
+    maestro_root = Path(maestro_root)
+
+    # ── Токенизатор ───────────────────────────────────────────────────────────
+    tokenizer = MusicTokenizer()
+
+    if tokenizer_path and os.path.exists(tokenizer_path):
+        tokenizer.load(tokenizer_path)
+        print(f"Tokenizer loaded from {tokenizer_path}  (vocab={tokenizer.vocab_size})")
+    else:
+        print("Building tokenizer from MAESTRO MIDI files...")
+        midi_files = [str(p) for p in maestro_root.glob('**/*.midi')]
+        midi_files += [str(p) for p in maestro_root.glob('**/*.mid')]
+        if not midi_files:
+            raise FileNotFoundError(f"MIDI файлы не найдены в {maestro_root}")
+        tokenizer.build_from_midi_files(midi_files)
+        if tokenizer_path:
+            tokenizer.save(tokenizer_path)
+            print(f"Tokenizer saved to {tokenizer_path}")
+
+    # ── Датасеты ─────────────────────────────────────────────────────────────
+    train_dataset = MaestroDataset(maestro_root, tokenizer, split='train',
+                                   segment_len=segment_len)
+    val_dataset   = MaestroDataset(maestro_root, tokenizer, split='validation',
+                                   segment_len=segment_len)
+
+    if len(train_dataset) == 0:
+        raise ValueError("Train dataset пустой — проверьте путь и CSV файл.")
+
+    # num_workers=0 обязательно на Windows
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device.type == 'cuda'),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(device.type == 'cuda'),
+    ) if len(val_dataset) > 0 else None
 
     return train_loader, val_loader, tokenizer
 
