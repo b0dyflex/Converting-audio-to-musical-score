@@ -1151,7 +1151,7 @@ class Audio2MusicInference:
 
     def __init__(self, model_path=None, device=device):
         self.device = device
-
+        print('im inside!')
         # Если путь не указан, ищем модель
         if model_path is None:
             # Ищем модель в разных местах
@@ -1168,7 +1168,7 @@ class Audio2MusicInference:
                     break
             if model_path is None:
                 raise FileNotFoundError("No model file found. Please train the model first.")
-
+        
         print(f"Loading model from: {model_path}")
 
         # Загружаем чекпоинт
@@ -1215,6 +1215,7 @@ class Audio2MusicInference:
 
         # Подготавливаем для модели
         audio_features = torch.FloatTensor(spectrogram).unsqueeze(0).unsqueeze(0).to(self.device)
+        print(audio_features)
 
         # Генерируем токены
         with torch.no_grad():

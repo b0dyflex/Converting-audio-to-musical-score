@@ -269,6 +269,7 @@ DIR_MUSICXML_PDF  = os.path.join(BASE_DIR, "musicxml-pdf")
 def _load_module(name: str, filepath: str):
     """Динамически загружает Python-модуль из указанного пути."""
     module_dir = os.path.dirname(filepath)
+    print(module_dir)
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
     spec = importlib.util.spec_from_file_location(name, filepath)
@@ -471,10 +472,8 @@ def transcribe_wav(
 
     midi_path     = os.path.join(output_dir, f"{output_name}.mid")
     musicxml_path = os.path.join(output_dir, f"{output_name}.musicxml")
-
     model_module = _load_module("model", os.path.join(DIR_MODEL, "model.py"))
     inferencer   = model_module.Audio2MusicInference(model_path=model_path)
-
     midi_out, musicxml_out = inferencer.transcribe_audio(
         wav_path,
         output_midi_path=midi_path,
