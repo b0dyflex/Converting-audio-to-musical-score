@@ -9,11 +9,12 @@ import pretty_midi
 import json
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Dict, Optional
 import warnings
 import time
 import glob
 
+#test
 warnings.filterwarnings('ignore')
 
 # Проверяем доступность GPU
@@ -27,39 +28,41 @@ if device.type == 'cuda':
 # ==================== Residual Block ====================
 
 class ResidualBlock(nn.Module):
-    """Residual блок с Pre-Norm (LayerNorm перед Conv) — лучше сходится"""
+    """Residual блок с GroupNorm и SE (Squeeze-and-Excitation)"""
 
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
 
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.gn1 = nn.GroupNorm(min(32, out_channels), out_channels)
 
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.gn2 = nn.GroupNorm(min(32, out_channels), out_channels)
 
-        # SE (Squeeze-and-Excitation) — канальное внимание
+        # SE (Squeeze-and-Excitation) — канальное внимание, squeeze ratio 1/8
+        squeeze = max(out_channels // 8, 4)
         self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(out_channels, max(out_channels // 16, 4)),
-            nn.ReLU(),
-            nn.Linear(max(out_channels // 16, 4), out_channels),
-            nn.Sigmoid(),
+            nn.AdaptiveAvgPool2d(1),       # 0
+            nn.Flatten(),                    # 1
+            nn.Linear(out_channels, squeeze),  # 2
+            nn.ReLU(),                       # 3
+            nn.Dropout(0.1),                 # 4
+            nn.Linear(squeeze, out_channels),  # 5
+            nn.Sigmoid(),                    # 6
         )
 
         self.downsample = None
         if stride != 1 or in_channels != out_channels:
             self.downsample = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels)
+                nn.GroupNorm(min(32, out_channels), out_channels)
             )
 
     def forward(self, x):
         identity = x
 
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
 
         # SE: масштабируем каналы по важности
         se_w = self.se(out).view(out.size(0), out.size(1), 1, 1)
@@ -76,29 +79,45 @@ class ResidualBlock(nn.Module):
 
 class AudioFeatureExtractor(nn.Module):
     """
-    CNN-Transformer энкодер.
-    CNN (с SE-блоками) → адаптивный пулинг → проекция → Transformer Encoder.
+    CNN-Transformer энкодер с мультиветочным входом и attention pooling.
+    Multi-branch Conv → Fusion → ResBlocks (GroupNorm + SE) → Attention Pool → Transformer Encoder.
     """
 
     def __init__(self, input_channels=1, hidden_dim=512, num_layers=4, dropout=0.1):
         super().__init__()
 
-        # Первичная свёртка
-        self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=(3, 3), padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
+        # Мультиветочная свёртка: 3 ветки с разными размерами ядер
+        branch_ch = 32
+        self.conv_branches = nn.ModuleList([
+            nn.Conv2d(input_channels, branch_ch, kernel_size=3, padding=1),
+            nn.Conv2d(input_channels, branch_ch, kernel_size=5, padding=2),
+            nn.Conv2d(input_channels, branch_ch, kernel_size=7, padding=3),
+        ])
+        self.bn_branches = nn.ModuleList([
+            nn.BatchNorm2d(branch_ch) for _ in range(3)
+        ])
+        # Fusion: объединяем 3 ветки (3*32=96) → 64 каналов
+        self.fusion = nn.Conv2d(branch_ch * 3, 64, kernel_size=1)
 
-        # ResNet-подобный стек с SE-блоками
+        # ResNet-подобный стек с SE-блоками (GroupNorm)
         self.res_blocks = nn.ModuleList([
             ResidualBlock(64,  128, stride=2),
             ResidualBlock(128, 256, stride=2),
             ResidualBlock(256, 512, stride=2),
             ResidualBlock(512, 512, stride=1),
+            ResidualBlock(512, 512, stride=1),
         ])
 
-        # Адаптивный пулинг + проекция в hidden_dim
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
-        self.conv_reduce   = nn.Conv1d(512, hidden_dim, kernel_size=1)
-        self.input_norm    = nn.LayerNorm(hidden_dim)
+        # Attention pooling по частотной оси
+        self.attention_pool = nn.Sequential(
+            nn.Conv1d(512, 128, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(128, 1, kernel_size=1),
+        )
+
+        # Проекция в hidden_dim
+        self.conv_reduce = nn.Conv1d(512, hidden_dim, kernel_size=1)
+        self.input_norm  = nn.LayerNorm(hidden_dim)
 
         # Трансформерный энкодер
         encoder_layer = nn.TransformerEncoderLayer(
@@ -107,7 +126,7 @@ class AudioFeatureExtractor(nn.Module):
             dim_feedforward=hidden_dim * 4,
             dropout=dropout,
             batch_first=True,
-            norm_first=True,   # Pre-LN: более стабильный градиент
+            norm_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers,
@@ -116,11 +135,27 @@ class AudioFeatureExtractor(nn.Module):
 
     def forward(self, x):
         # x: [B, 1, freq, time]
-        x = F.relu(self.bn1(self.conv1(x)))
+        # Multi-branch input
+        branches = []
+        for conv, bn in zip(self.conv_branches, self.bn_branches):
+            branches.append(F.relu(bn(conv(x))))
+        x = torch.cat(branches, dim=1)  # [B, 96, freq, time]
+        x = F.relu(self.fusion(x))       # [B, 64, freq, time]
+
         for block in self.res_blocks:
             x = block(x)
+        # x: [B, 512, freq', time']
 
-        x = self.adaptive_pool(x).squeeze(2)          # [B, 512, T]
+        # Attention pooling по частотной оси
+        B, C, F_dim, T = x.shape
+        # Считаем веса внимания для каждого частотного бина
+        attn_input = x.permute(0, 3, 1, 2).reshape(B * T, C, F_dim)  # [B*T, 512, F']
+        attn_weights = self.attention_pool(attn_input)                 # [B*T, 1, F']
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        # Взвешенная сумма по частоте
+        pooled = (attn_input * attn_weights).sum(dim=-1)               # [B*T, 512]
+        x = pooled.reshape(B, T, C).permute(0, 2, 1)                  # [B, 512, T]
+
         x = self.conv_reduce(x).permute(0, 2, 1)      # [B, T, hidden_dim]
         x = self.input_norm(x)
         x = self.transformer_encoder(x)
@@ -130,7 +165,6 @@ class AudioFeatureExtractor(nn.Module):
 # ==================== Music Tokenizer ====================
 
 class MusicTokenizer:
-    """Токенизатор для нотной партитуры"""
 
     def __init__(self, vocab_size=5000):
         self.vocab = {
@@ -261,6 +295,10 @@ class MusicTokenizer:
         return encoded
 
 
+# Alias for backward compatibility with older checkpoints
+EnhancedMusicTokenizer = MusicTokenizer
+
+
 # ==================== Positional Encoding ====================
 
 class PositionalEncoding(nn.Module):
@@ -293,7 +331,7 @@ class MusicTransformerDecoder(nn.Module):
     Принимает memory из энкодера и авторегрессивно генерирует токены.
     """
 
-    def __init__(self, vocab_size, hidden_dim=512, num_layers=6, dropout=0.1, max_len=500):
+    def __init__(self, vocab_size, hidden_dim=512, num_layers=6, dropout=0.1, max_len=1000):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -313,12 +351,15 @@ class MusicTransformerDecoder(nn.Module):
             norm=nn.LayerNorm(hidden_dim),
         )
 
-        # Двухслойная проекция: hidden → hidden//2 → vocab
+        # Трёхслойная проекция: hidden → hidden → hidden//2 → vocab
         self.fc_out = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, vocab_size),
+            nn.Linear(hidden_dim, hidden_dim),       # 0
+            nn.GELU(),                                # 1
+            nn.Dropout(dropout),                      # 2
+            nn.Linear(hidden_dim, hidden_dim // 2),   # 3
+            nn.GELU(),                                # 4
+            nn.Dropout(dropout),                      # 5
+            nn.Linear(hidden_dim // 2, vocab_size),   # 6
         )
 
     def forward(self, tgt, memory, tgt_mask=None, tgt_key_padding_mask=None):
@@ -1142,6 +1183,13 @@ class Audio2MusicInference:
               f"enc_layers={enc_layers}, dec_layers={dec_layers}")
 
         # Создаём и загружаем модель с правильными размерами
+        self.model = Audio2MusicModel(
+            vocab_size=vocab_size,
+            hidden_dim=hidden_dim,
+            num_encoder_layers=enc_layers,
+            num_decoder_layers=dec_layers
+        ).to(device)
+
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
 
@@ -1202,13 +1250,13 @@ class Audio2MusicInference:
                 token_str = self.tokenizer.reverse_vocab.get(tokens[i], '')
                 if token_str.startswith('PITCH_'):
                     # Извлекаем информацию о ноте
-                    pitch = int(token_str.split('_')[1])
+                    pitch = min(max(int(token_str.split('_')[1]), 0), 127)
 
                     if i + 2 < len(tokens):
                         vel_token = self.tokenizer.reverse_vocab.get(tokens[i + 1], 'VEL_7')
                         dur_token = self.tokenizer.reverse_vocab.get(tokens[i + 2], 'DUR_quarter')
 
-                        velocity = int(vel_token.split('_')[1]) * 10 + 20
+                        velocity = min(int(vel_token.split('_')[1]) * 10 + 20, 127)
 
                         # Конвертируем длительность в секунды
                         duration_map = {
