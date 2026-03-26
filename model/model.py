@@ -14,6 +14,7 @@ import warnings
 import time
 import glob
 
+#test
 warnings.filterwarnings('ignore')
 
 # Проверяем доступность GPU
