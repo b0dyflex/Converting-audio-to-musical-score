@@ -9,7 +9,7 @@ import pretty_midi
 import json
 import os
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List
 import warnings
 import time
 import glob
@@ -1125,7 +1125,6 @@ class Audio2MusicInference:
                 if os.path.exists(path):
                     model_path = path
                     break
-
             if model_path is None:
                 raise FileNotFoundError("No model file found. Please train the model first.")
 
@@ -1143,13 +1142,6 @@ class Audio2MusicInference:
               f"enc_layers={enc_layers}, dec_layers={dec_layers}")
 
         # Создаём и загружаем модель с правильными размерами
-        self.model = Audio2MusicModel(
-            vocab_size=vocab_size,
-            hidden_dim=hidden_dim,
-            num_encoder_layers=enc_layers,
-            num_decoder_layers=dec_layers
-        ).to(device)
-
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
 
