@@ -1,3 +1,7 @@
 venv/
 .idea/
 midi-musicxml/__pycache__/
+**.wav
+**.mid
+**.musicxml
+**/__pycache__/
