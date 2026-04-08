@@ -1,11 +1,15 @@
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from model.model import Audio2MusicInference
+<<<<<<< HEAD
 from containers import ApplicationContainer
+=======
+>>>>>>> b234dd04b347751390542835d35f6c2a3fd1fff2
 import torch
 from importlib.util import spec_from_file_location, module_from_spec
 import os
 import sys
+<<<<<<< HEAD
 from contextlib import asynccontextmanager
 import asyncio
 
@@ -20,6 +24,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+=======
+
+app = FastAPI()
+>>>>>>> b234dd04b347751390542835d35f6c2a3fd1fff2
 
 @app.post('/note')
 def transcribe(audio_path: str):
