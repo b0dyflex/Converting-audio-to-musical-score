@@ -1,40 +1,34 @@
 """
-train.py v4 — с исправлениями градиентного взрыва
-==================================================
-Ключевые изменения по сравнению с v3:
+train.py v5 — CNN14 + note F1
+==============================
+Изменения по сравнению с v4:
 
-1. LR СНИЖЕН:
-   - lr_decoder = 1e-4 (было 1e-3, снижен в 10 раз)
-   - lr_encoder = 1e-5 (было 1e-4, снижен в 10 раз)
+1. ЭНКОДЕР CNN14 (вместо ResNet18)
+   - Параметр pretrained_encoder=True использует веса PANNs (AudioSet)
+   - Веса автоматически скачиваются в --weights_dir при первом запуске
+   - dense_time=False (по умолчанию) — 27 позиций, совместимо с весами PANNs
 
-2. ПЛАНИРОВЩИК ЗАМЕНЁН:
-   - Убран косинусный decay --> ExponentialLR (gamma=0.95)
-   - Warmup остался (линейный, 400 шагов)
-   - Мотивация: косинусный decay может создавать резкие скачки LR
-     которые провоцируют взрыв градиентов
+2. NOTE F1 МЕТРИКИ
+   - pitch_f1: F1 по multiset питчей NOTE_ON (без учёта времени)
+   - onset_f1: F1 по (pitch, onset_time) с допуском ±50 мс
+   - Считается на validation каждую эпоху (greedy на argmax — без sampling)
+   - Дополнительно — на train (с малым sample_rate, чтобы не тормозить)
+   - Логируется в epoch_metrics.csv
 
-3. NaN ОБРАБОТКА УЛУЧШЕНА:
-   - При nan сразу zero_grad() + scaler.update()
-   - Считаем nan-батчи за эпоху для мониторинга
-   - Если >5% батчей дают nan — предупреждение
-
-4. МОНИТОРИНГ ГРАДИЕНТОВ:
-   - Каждые log_every шагов логируем min/max/mean градиентов
-   - Отдельно для энкодера и декодера
-   - Сохраняется в grad_monitor.csv
-
-5. ФИЛЬТРАЦИЯ ПУСТЫХ СЕГМЕНТОВ:
-   - Dataset по умолчанию пропускает пустые спектрограммы
-   - Это убирает основной источник nan
+3. РАЗДЕЛЬНЫЙ LR-CONFIG ДЛЯ ENCODER/DECODER
+   - lr_encoder = 5e-5 (PANNs веса лучше дрожать аккуратно)
+   - lr_decoder = 3e-4 (декодер учится с нуля)
+   - Это менее агрессивно чем v4 для декодера и менее консервативно
+     для энкодера, чем 1e-5 (v4) — pretrained CNN14 надёжнее, чем v4 ожидала.
 
 Запуск:
-    python train.py \
-        --dataset_dir /path/to/dataset \
-        --output_dir  /path/to/checkpoints
+    python train.py --dataset_dir dataset --output_dir checkpoints
 
-    # Продолжить с best_model.pt и сброшенным оптимизатором:
-    python train.py --dataset_dir dataset --output_dir checkpoints \
-        --reset_optimizer true
+    # С отключением pretrained:
+    python train.py --pretrained_encoder false
+
+    # С кастомной директорией для весов PANNs:
+    python train.py --weights_dir /path/to/pretrained
 """
 
 from __future__ import annotations
@@ -55,6 +49,7 @@ from torch.utils.data import DataLoader, random_split
 from model import ScoreGenerationModel
 from dataset import MidiSpectrogramDataset
 from tokenizer import PAD_TOKEN, VOCAB_SIZE
+from metrics import NoteF1Stats
 
 # ══════════════════════════════════════════════════════════════
 #  Конфигурация
@@ -63,26 +58,29 @@ CONFIG = dict(
     # Данные
     dataset_dir="dataset",
     output_dir="checkpoints",
+    weights_dir="./pretrained",  # директория для весов PANNs
     max_seq_len=256,
     max_freq_bins=128,
     max_time_steps=216,
+    max_samples=0,
 
-    # Архитектура
+    # Архитектура (CNN14)
     d_model=256,
     nhead=8,
     num_decoder_layers=6,
     dim_feedforward=1024,
     dropout=0.1,
     pretrained_encoder=True,
+    dense_time=False,            # True = 54 позиции, но без претрейна
 
     # Обучение
     batch_size=8,
-    accum_steps=2,      # эффективный batch = 16
+    accum_steps=2,
     num_epochs=30,
 
-    # ── LR (СНИЖЕН × 10) ────────────────────────────────────
-    lr_decoder=1e-4,    # было 1e-3
-    lr_encoder=1e-5,    # было 1e-4
+    # ── LR (откалиброван под CNN14 + PANNs pretrained) ─────────
+    lr_decoder=3e-4,
+    lr_encoder=5e-5,
 
     weight_decay=1e-2,
     warmup_steps=400,
@@ -94,13 +92,22 @@ CONFIG = dict(
     ema_decay=0.999,
     reset_optimizer=False,
 
-    # ── Планировщик (ЗАМЕНЁН) ────────────────────────────────
-    scheduler_type="exponential",   # "exponential" или "cosine"
-    exp_gamma=0.95,                 # для ExponentialLR: LR *= gamma каждую эпоху
+    # Планировщик
+    scheduler_type="exponential",
+    exp_gamma=0.95,
 
-    # ── Фильтрация пустых сегментов ──────────────────────────
+    # Фильтрация пустых сегментов
     skip_silent=False,
     silence_threshold=0.01,
+
+    # Note F1
+    onset_tolerance_ms=50,
+    train_f1_every=200,          # считать F1 на train каждые N step (0 = не считать)
+
+    # Mixed precision / отладка
+    use_amp=True,                # False = отключить mixed precision (для отладки NaN)
+    amp_dtype="bfloat16",        # "bfloat16" (рекомендовано для CNN14) или "float16"
+    debug_first_batch=True,      # печатать статистику активаций на первом батче
 )
 
 
@@ -108,24 +115,18 @@ CONFIG = dict(
 #  Планировщики
 # ══════════════════════════════════════════════════════════════
 class WarmupCosineScheduler(torch.optim.lr_scheduler.LambdaLR):
-    """Оригинальный планировщик (оставлен для сравнения)."""
     def __init__(self, optimizer, warmup_steps: int, total_steps: int):
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
             t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return max(0.0, 0.5 * (1.0 + math.cos(math.pi * t)))
+
         super().__init__(optimizer, lr_lambda)
 
 
 class WarmupExponentialScheduler(torch.optim.lr_scheduler.LambdaLR):
-    """
-    Линейный warmup --> экспоненциальный decay.
-    После warmup LR уменьшается плавно: LR *= gamma^(step/steps_per_epoch).
-    Менее агрессивный чем косинусный — не создаёт резких скачков.
-    """
-    def __init__(self, optimizer, warmup_steps: int, gamma: float,
-                 steps_per_epoch: int):
+    def __init__(self, optimizer, warmup_steps: int, gamma: float, steps_per_epoch: int):
         self._warmup = warmup_steps
         self._gamma = gamma
         self._spe = max(1, steps_per_epoch)
@@ -133,7 +134,6 @@ class WarmupExponentialScheduler(torch.optim.lr_scheduler.LambdaLR):
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
-            # Экспоненциальный decay: gamma^(epoch_fraction)
             elapsed = step - warmup_steps
             epoch_frac = elapsed / self._spe
             return self._gamma ** epoch_frac
@@ -173,40 +173,54 @@ def accuracy_no_pad(logits, targets):
 
 
 class MetricsLogger:
+    """Логгер с поддержкой F1-метрик (расширен по сравнению с v4)."""
+
     def __init__(self, path: Path):
         self.path = path
         self._step_path = path.parent / "step_metrics.csv"
         self.global_step = 0
         with open(self.path, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["epoch", "train_loss", "train_acc", "val_loss", "val_acc",
-                 "lr_dec", "lr_enc", "elapsed_s", "nan_batches"])
+            csv.writer(f).writerow([
+                "epoch", "train_loss", "train_acc", "val_loss", "val_acc",
+                "train_pitch_f1", "train_onset_f1",
+                "val_pitch_f1", "val_onset_f1",
+                "lr_dec", "lr_enc", "elapsed_s", "nan_batches",
+            ])
         with open(self._step_path, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["global_step", "epoch", "step", "loss", "acc", "lr_dec"])
+            csv.writer(f).writerow([
+                "global_step", "epoch", "step", "loss", "acc",
+                "pitch_f1", "onset_f1", "lr_dec",
+            ])
 
-    def log_step(self, epoch, step, loss, acc, lr_dec):
+    def log_step(self, epoch, step, loss, acc, lr_dec,
+                 pitch_f1=None, onset_f1=None):
         self.global_step += 1
         with open(self._step_path, "a", newline="") as f:
-            csv.writer(f).writerow(
-                [self.global_step, epoch, step,
-                 f"{loss:.6f}", f"{acc:.6f}", f"{lr_dec:.8f}"])
+            csv.writer(f).writerow([
+                self.global_step, epoch, step,
+                f"{loss:.6f}", f"{acc:.6f}",
+                f"{pitch_f1:.6f}" if pitch_f1 is not None else "",
+                f"{onset_f1:.6f}" if onset_f1 is not None else "",
+                f"{lr_dec:.8f}",
+            ])
 
-    def log_epoch(self, epoch, tl, ta, vl, va, lr_dec, lr_enc, elapsed,
-                  nan_batches=0):
+    def log_epoch(self, epoch, tl, ta, vl, va,
+                  train_pf1, train_of1, val_pf1, val_of1,
+                  lr_dec, lr_enc, elapsed, nan_batches=0):
         with open(self.path, "a", newline="") as f:
-            csv.writer(f).writerow(
-                [epoch, f"{tl:.6f}", f"{ta:.6f}", f"{vl:.6f}", f"{va:.6f}",
-                 f"{lr_dec:.8f}", f"{lr_enc:.8f}", f"{elapsed:.1f}",
-                 nan_batches])
+            csv.writer(f).writerow([
+                epoch, f"{tl:.6f}", f"{ta:.6f}", f"{vl:.6f}", f"{va:.6f}",
+                f"{train_pf1:.6f}", f"{train_of1:.6f}",
+                f"{val_pf1:.6f}", f"{val_of1:.6f}",
+                f"{lr_dec:.8f}", f"{lr_enc:.8f}", f"{elapsed:.1f}",
+                nan_batches,
+            ])
 
 
 # ══════════════════════════════════════════════════════════════
-#  Мониторинг градиентов
+#  Мониторинг градиентов (без изменений)
 # ══════════════════════════════════════════════════════════════
 class GradMonitor:
-    """Логирует статистику градиентов для обнаружения аномалий."""
-
     def __init__(self, path: Path):
         self.path = path
         with open(self.path, "w", newline="") as f:
@@ -219,8 +233,7 @@ class GradMonitor:
 
     def log(self, model):
         self.global_step += 1
-        enc_grads = []
-        dec_grads = []
+        enc_grads, dec_grads = [], []
         for name, p in model.named_parameters():
             if p.grad is not None:
                 g = p.grad.data.abs()
@@ -245,7 +258,6 @@ class GradMonitor:
                 f"{d_min:.6f}", f"{d_max:.6f}", f"{d_mean:.6f}",
             ])
 
-        # Предупреждение при аномальных градиентах
         if d_max > 10.0:
             print(f"  [!] ГРАДИЕНТ АНОМАЛИЯ: dec_grad_max={d_max:.2f}")
         if e_max > 10.0:
@@ -255,29 +267,71 @@ class GradMonitor:
 # ══════════════════════════════════════════════════════════════
 #  Шаг обучения
 # ══════════════════════════════════════════════════════════════
-def train_step(model, batch, criterion, scaler, device, accum_steps, step_idx):
+def train_step(model, batch, criterion, scaler, device, accum_steps, step_idx,
+               return_preds: bool = False, use_amp: bool = True,
+               amp_dtype=None, debug: bool = False):
+    """
+    Возвращает (loss, acc, do_update, preds_or_None).
+    use_amp=False → отключает mixed precision (полезно для отладки NaN).
+    amp_dtype: torch.float16 или torch.bfloat16. bfloat16 рекомендован для CNN
+        с большими активациями (например, CNN14) — он имеет тот же диапазон,
+        что float32, и не подвержен overflow.
+    debug=True → печатает статистику активаций каждого слоя энкодера.
+    """
     specs, src, tgt, pad_mask = [t.to(device) for t in batch]
 
-    with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-        logits = model(specs, src, tgt_key_padding_mask=pad_mask)
+    if debug:
+        with torch.no_grad():
+            print(f"  [DBG] specs: shape={tuple(specs.shape)} "
+                  f"min={specs.min().item():.4f} max={specs.max().item():.4f} "
+                  f"mean={specs.mean().item():.4f} "
+                  f"nan={torch.isnan(specs).any().item()}")
+            print(f"  [DBG] tgt: shape={tuple(tgt.shape)} "
+                  f"min={tgt.min().item()} max={tgt.max().item()} "
+                  f"non_pad={(tgt != 0).sum().item()}/{tgt.numel()}")
+
+    autocast_enabled = use_amp and (device.type == "cuda")
+    autocast_kwargs = {"device_type": device.type, "enabled": autocast_enabled}
+    if amp_dtype is not None and autocast_enabled:
+        autocast_kwargs["dtype"] = amp_dtype
+
+    with torch.autocast(**autocast_kwargs):
+        logits = model(specs, src, tgt_key_padding_mask=pad_mask, debug=debug)
+        if debug:
+            with torch.no_grad():
+                print(f"  [DBG] logits: shape={tuple(logits.shape)} "
+                      f"min={logits.min().item():.4f} "
+                      f"max={logits.max().item():.4f} "
+                      f"nan={torch.isnan(logits).any().item()} "
+                      f"inf={torch.isinf(logits).any().item()}")
         loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1)) / accum_steps
 
-    # ── Проверка на nan/inf ПЕРЕД backward ───────────────────
-    if not math.isfinite(loss.item() * accum_steps):
-        return float("nan"), 0.0, (step_idx + 1) % accum_steps == 0
+    if debug:
+        print(f"  [DBG] loss: {loss.item() * accum_steps:.6f}")
 
+    if not math.isfinite(loss.item() * accum_steps):
+        return float("nan"), 0.0, (step_idx + 1) % accum_steps == 0, None
+
+    # GradScaler.scale() is no-op if scaler is disabled (bf16 / FP32),
+    # so we can call it unconditionally — it's safe.
     scaler.scale(loss).backward()
     acc = accuracy_no_pad(logits.detach(), tgt)
-    return loss.item() * accum_steps, acc, (step_idx + 1) % accum_steps == 0
+    preds = logits.detach().argmax(-1) if return_preds else None
+    return loss.item() * accum_steps, acc, (step_idx + 1) % accum_steps == 0, preds
 
 
 # ══════════════════════════════════════════════════════════════
-#  Валидация
+#  Валидация с F1
 # ══════════════════════════════════════════════════════════════
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, onset_tolerance_sec: float):
+    """
+    Возвращает: (val_loss, val_acc, pitch_f1, onset_f1)
+    """
     model.eval()
     tot_loss, tot_acc, n = 0.0, 0.0, 0
+    f1_stats = NoteF1Stats(onset_tolerance_sec=onset_tolerance_sec)
+
     for batch in loader:
         specs, src, tgt, pad_mask = [t.to(device) for t in batch]
         logits = model(specs, src, tgt_key_padding_mask=pad_mask)
@@ -287,8 +341,15 @@ def validate(model, loader, criterion, device):
             tot_loss += loss_val
             tot_acc += accuracy_no_pad(logits, tgt)
             n += 1
+        # F1 по argmax-предсказаниям (teacher-forced)
+        preds = logits.argmax(-1)
+        f1_stats.update(preds, tgt)
+
     model.train()
-    return (tot_loss / n, tot_acc / n) if n > 0 else (0.0, 0.0)
+    summary = f1_stats.summary()
+    if n > 0:
+        return tot_loss / n, tot_acc / n, summary["pitch_f1"], summary["onset_f1"]
+    return 0.0, 0.0, summary["pitch_f1"], summary["onset_f1"]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -304,15 +365,23 @@ def train(cfg: dict):
     logger = MetricsLogger(out_dir / "epoch_metrics.csv")
     grad_mon = GradMonitor(out_dir / "grad_monitor.csv")
 
+    onset_tol_sec = cfg["onset_tolerance_ms"] / 1000.0
+
     # ── Данные ───────────────────────────────────────────────
     full_dataset = MidiSpectrogramDataset(
         dataset_root=cfg["dataset_dir"],
         max_seq_len=cfg["max_seq_len"],
         max_freq_bins=cfg["max_freq_bins"],
         max_time_steps=cfg["max_time_steps"],
-        skip_silent=cfg.get("skip_silent", True),
+        skip_silent=cfg.get("skip_silent", False),
         silence_threshold=cfg.get("silence_threshold", 0.01),
     )
+
+    max_samples = cfg.get("max_samples", 0)
+    if max_samples > 0 and max_samples < len(full_dataset):
+        from torch.utils.data import Subset
+        full_dataset = Subset(full_dataset, list(range(max_samples)))
+        print(f"Датасет ограничен: {max_samples}")
     n_val = max(1, int(len(full_dataset) * cfg["val_ratio"]))
     n_train = len(full_dataset) - n_val
     train_ds, val_ds = random_split(full_dataset, [n_train, n_val])
@@ -335,17 +404,17 @@ def train(cfg: dict):
         max_seq_len=cfg["max_seq_len"],
         dropout=cfg["dropout"],
         pretrained_encoder=cfg["pretrained_encoder"],
+        weights_dir=cfg["weights_dir"],
+        dense_time=cfg["dense_time"],
     ).to(device)
 
     ema = ModelEMA(model, decay=cfg["ema_decay"]) if cfg["use_ema"] else None
 
-    # ── Оптимизатор с раздельным LR ──────────────────────────
     optimizer = torch.optim.AdamW(
         model.get_param_groups(cfg["lr_encoder"], cfg["lr_decoder"]),
         weight_decay=cfg["weight_decay"],
     )
 
-    # ── Планировщик ──────────────────────────────────────────
     steps_per_epoch = len(train_loader) // cfg["accum_steps"]
     total_steps = steps_per_epoch * cfg["num_epochs"]
 
@@ -362,18 +431,36 @@ def train(cfg: dict):
             optimizer, cfg["warmup_steps"], total_steps)
         sched_name = "WarmupCosine"
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+    use_amp = cfg.get("use_amp", True)
+    amp_dtype_str = cfg.get("amp_dtype", "bfloat16").lower()
+    if amp_dtype_str == "bfloat16":
+        amp_dtype = torch.bfloat16
+    elif amp_dtype_str == "float16":
+        amp_dtype = torch.float16
+    else:
+        raise ValueError(f"amp_dtype must be 'bfloat16' or 'float16', got '{amp_dtype_str}'")
+
+    # GradScaler нужен только для float16 (bfloat16 не имеет проблем с underflow градиентов).
+    scaler_enabled = use_amp and device.type == "cuda" and amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN, label_smoothing=0.1)
 
     print(f"LR: decoder={cfg['lr_decoder']:.0e}  encoder={cfg['lr_encoder']:.0e}")
     print(f"Warmup: {cfg['warmup_steps']} steps  |  Scheduler: {sched_name}")
     print(f"Grad clip: {cfg['grad_clip']}  |  Label smoothing: 0.1")
+    print(f"Note F1: pitch (multiset) + onset (±{cfg['onset_tolerance_ms']}мс)")
+    if use_amp:
+        print(f"AMP: ON ({amp_dtype_str}, GradScaler={'ON' if scaler_enabled else 'OFF'})")
+    else:
+        print(f"AMP: OFF (FP32)")
 
     # ── Загрузка чекпоинта ───────────────────────────────────
     start_epoch = 0
     best_val_loss = float("inf")
+    best_val_f1 = 0.0
     ckpt_path = out_dir / "last.pt"
     best_path = out_dir / "best_model.pt"
+    best_f1_path = out_dir / "best_f1_model.pt"
     reset_optimizer = cfg.get("reset_optimizer", False)
 
     if ckpt_path.exists() and not reset_optimizer:
@@ -383,9 +470,11 @@ def train(cfg: dict):
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        best_val_f1 = ckpt.get("best_val_f1", 0.0)
         if ema and "ema" in ckpt:
             ema.shadow.load_state_dict(ckpt["ema"])
-        print(f"Возобновление с эпохи {start_epoch} (best={best_val_loss:.4f})")
+        print(f"Возобновление с эпохи {start_epoch} "
+              f"(best_loss={best_val_loss:.4f}, best_f1={best_val_f1:.4f})")
     elif best_path.exists() and reset_optimizer:
         weights = torch.load(best_path, map_location=device)
         model.load_state_dict(weights)
@@ -393,108 +482,155 @@ def train(cfg: dict):
             ema.shadow.load_state_dict(weights)
         start_epoch = 0
         best_val_loss = float("inf")
-        print(f"Загружены лучшие веса из best_model.pt")
-        print(f"Оптимизатор СБРОШЕН: lr_dec={cfg['lr_decoder']:.0e}")
+        best_val_f1 = 0.0
+        print(f"Загружены лучшие веса из best_model.pt; оптимизатор СБРОШЕН")
     else:
         print("Чекпоинт не найден — обучение с нуля")
 
     # ── Цикл ─────────────────────────────────────────────────
     model.train()
     optimizer.zero_grad()
+    train_f1_every = cfg.get("train_f1_every", 0)
+    debug_first_batch = cfg.get("debug_first_batch", True)
 
     for epoch in range(start_epoch, cfg["num_epochs"]):
         ep_loss, ep_acc = 0.0, 0.0
         ep_valid_steps = 0
         ep_nan_count = 0
+        # Аккумулятор F1 на train (по подвыборке батчей)
+        train_f1_stats = NoteF1Stats(onset_tolerance_sec=onset_tol_sec)
+        last_pf1, last_of1 = 0.0, 0.0
         t0 = time.time()
 
         for step_idx, batch in enumerate(train_loader):
-            loss, acc, do_update = train_step(
+            # Считаем preds на каждом N-ом шаге для F1
+            need_preds = (train_f1_every > 0 and (step_idx + 1) % train_f1_every == 0)
+            # Debug на первом батче самой первой эпохи (или после reset)
+            do_debug = debug_first_batch and epoch == start_epoch and step_idx == 0
+            if do_debug:
+                print("\n  ━━━━━ DEBUG: первый forward (диагностика NaN) ━━━━━")
+            loss, acc, do_update, preds = train_step(
                 model, batch, criterion, scaler, device,
                 cfg["accum_steps"], step_idx,
+                return_preds=need_preds,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                debug=do_debug,
             )
+            if do_debug:
+                print("  ━━━━━ end DEBUG ━━━━━\n")
 
             if math.isfinite(loss):
                 ep_loss += loss
                 ep_acc += acc
                 ep_valid_steps += 1
             else:
-                # NaN: сброс градиентов, пропуск батча
                 ep_nan_count += 1
                 optimizer.zero_grad()
                 continue
 
-            if do_update:
-                scaler.unscale_(optimizer)
-                # Проверяем градиенты перед клиппингом
-                total_norm = nn.utils.clip_grad_norm_(
-                    model.parameters(), cfg["grad_clip"])
+            # Обновляем F1 на train, если посчитали preds
+            if need_preds and preds is not None:
+                tgt = batch[2].to(device)
+                train_f1_stats.update(preds, tgt)
+                summary = train_f1_stats.summary()
+                last_pf1, last_of1 = summary["pitch_f1"], summary["onset_f1"]
 
-                if math.isfinite(total_norm.item()):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-                    if ema:
-                        ema.update(model)
-                    # Логируем градиенты периодически
-                    if (step_idx + 1) % cfg["log_every"] == 0:
-                        grad_mon.log(model)
+            if do_update:
+                if scaler_enabled:
+                    # FP16: unscale → clip → step → update
+                    scaler.unscale_(optimizer)
+                    total_norm = nn.utils.clip_grad_norm_(
+                        model.parameters(), cfg["grad_clip"])
+                    if math.isfinite(total_norm.item()):
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
+                        if ema:
+                            ema.update(model)
+                        if (step_idx + 1) % cfg["log_every"] == 0:
+                            grad_mon.log(model)
+                    else:
+                        print(f"  [!] Grad norm = {total_norm.item():.2f} (inf/nan), пропуск")
+                        scaler.update()
                 else:
-                    # Градиенты inf/nan — пропускаем step
-                    print(f"  [!] Grad norm = {total_norm.item():.2f} "
-                          f"(inf/nan), пропуск шага")
-                    scaler.update()
+                    # FP32 / bfloat16: GradScaler не используется
+                    total_norm = nn.utils.clip_grad_norm_(
+                        model.parameters(), cfg["grad_clip"])
+                    if math.isfinite(total_norm.item()):
+                        optimizer.step()
+                        scheduler.step()
+                        if ema:
+                            ema.update(model)
+                        if (step_idx + 1) % cfg["log_every"] == 0:
+                            grad_mon.log(model)
+                    else:
+                        print(f"  [!] Grad norm = {total_norm.item():.2f} (inf/nan), пропуск")
 
                 optimizer.zero_grad()
 
             if (step_idx + 1) % cfg["log_every"] == 0:
                 lr_dec = optimizer.param_groups[1]["lr"]
                 lr_enc = optimizer.param_groups[0]["lr"]
-                logger.log_step(epoch + 1, step_idx + 1, loss, acc, lr_dec)
+                logger.log_step(epoch + 1, step_idx + 1, loss, acc, lr_dec,
+                                pitch_f1=last_pf1 if train_f1_every > 0 else None,
+                                onset_f1=last_of1 if train_f1_every > 0 else None)
+                f1_str = (f"  pf1={last_pf1:.3f} of1={last_of1:.3f}"
+                          if train_f1_every > 0 else "")
                 print(f"  Epoch {epoch + 1} step {step_idx + 1}/"
                       f"{len(train_loader)} | "
                       f"loss={loss:.4f}  acc={acc:.3f}  "
                       f"lr_dec={lr_dec:.2e}  lr_enc={lr_enc:.2e}  "
-                      f"nan={ep_nan_count}")
+                      f"nan={ep_nan_count}{f1_str}")
 
         # ── Статистика эпохи ─────────────────────────────────
         n_steps = max(1, ep_valid_steps)
         avg_loss = ep_loss / n_steps
         avg_acc = ep_acc / n_steps
 
+        train_summary = train_f1_stats.summary()
+        train_pf1 = train_summary["pitch_f1"]
+        train_of1 = train_summary["onset_f1"]
+
         val_model = ema.get_model() if ema else model
-        val_loss, val_acc = validate(val_model, val_loader, criterion, device)
+        val_loss, val_acc, val_pf1, val_of1 = validate(
+            val_model, val_loader, criterion, device, onset_tol_sec)
         elapsed = time.time() - t0
 
         lr_dec = optimizer.param_groups[1]["lr"]
         lr_enc = optimizer.param_groups[0]["lr"]
         logger.log_epoch(epoch + 1, avg_loss, avg_acc, val_loss, val_acc,
+                         train_pf1, train_of1, val_pf1, val_of1,
                          lr_dec, lr_enc, elapsed, ep_nan_count)
 
-        # ── Предупреждения ───────────────────────────────────
         nan_pct = ep_nan_count / max(1, len(train_loader)) * 100
         nan_warn = f"  [!] NaN: {ep_nan_count} ({nan_pct:.1f}%)" if ep_nan_count > 0 else ""
 
         print(f"Epoch {epoch + 1:3d} | "
               f"train loss={avg_loss:.4f} acc={avg_acc:.3f} | "
               f"val loss={val_loss:.4f} acc={val_acc:.3f} | "
+              f"val pitch_f1={val_pf1:.3f} onset_f1={val_of1:.3f} | "
               f"{elapsed:.1f}s{nan_warn}")
 
         if nan_pct > 5.0:
-            print(f"  [!] ВНИМАНИЕ: {nan_pct:.1f}% батчей дали NaN! "
-                  f"Проверьте данные и LR.")
+            print(f"  [!] ВНИМАНИЕ: {nan_pct:.1f}% батчей дали NaN!")
 
-        # ── Детекция градиентного взрыва ─────────────────────
         if epoch > 0 and avg_loss > 5.5:
-            print(f"  [!] ВОЗМОЖНЫЙ ВЗРЫВ: train loss={avg_loss:.4f} > 5.5 "
-                  f"(random baseline ~5.97)")
+            print(f"  [!] ВОЗМОЖНЫЙ ВЗРЫВ: train loss={avg_loss:.4f} > 5.5")
 
         # ── Сохранение ───────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_m = ema.get_model() if ema else model
             torch.save(save_m.state_dict(), out_dir / "best_model.pt")
-            print(f"  * Лучшая модель (val_loss={val_loss:.4f})")
+            print(f"  * Лучшая модель по loss (val_loss={val_loss:.4f})")
+
+        # Отдельно сохраняем лучшую по onset_f1 — это финальная метрика качества
+        if val_of1 > best_val_f1:
+            best_val_f1 = val_of1
+            save_m = ema.get_model() if ema else model
+            torch.save(save_m.state_dict(), out_dir / "best_f1_model.pt")
+            print(f"  * Лучшая модель по F1 (val_onset_f1={val_of1:.4f})")
 
         if (epoch + 1) % cfg["save_every"] == 0:
             ckpt_data = {
@@ -503,6 +639,7 @@ def train(cfg: dict):
                 "scheduler": scheduler.state_dict(),
                 "val_loss": val_loss,
                 "best_val_loss": best_val_loss,
+                "best_val_f1": best_val_f1,
             }
             if ema:
                 ckpt_data["ema"] = ema.shadow.state_dict()

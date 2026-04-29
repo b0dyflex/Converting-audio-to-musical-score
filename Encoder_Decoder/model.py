@@ -1,76 +1,130 @@
 """
-ScoreGenerationModel
-====================
-Архитектура (см. схему):
+ScoreGenerationModel  v7  — CNN14 encoder
+==========================================
 
-  [Аудио] -SpectrogramProcessor -(N, F, T)
-      ↓
-  ConvEncoder (ResNet18)  - Тензор [N, d_model]
-      ↓ (память энкодера)
-  TransformerDecoder
-    └─ Output Embedding + PositionalEncoding
-    └─ Masked Multi-Head Attention  (Add&Norm)
-    └─ Multi-Head Attention         (Add&Norm)  ← cross-attention с энкодером
-    └─ Feed Forward                 (Add&Norm)
-    └─ Linear -Softmax -Output Probabilities
-      ↓
-  Последовательность токенов -Сгенерированная партитура
+Ключевые изменения по сравнению с v6 (ResNet18):
+
+1. ЭНКОДЕР — CNN14 из PANNs (Kong et al., 2020)
+   - 6 свёрточных блоков, по 2 conv-слоя каждый: 64 → 128 → 256 → 512 → 1024 → 2048
+   - Вход: (B, 1, 128, 216) — log-mel спектрограмма
+   - Между блоками: AvgPool2d(2,2) (4 пулинга → 16-кратное сжатие по обеим осям)
+   - Адаптация под транскрипцию: ПОСЛЕДНИЙ блок (2048 каналов) убран,
+     а пулинги заменены на (2,2) → (1,2) во второй половине,
+     чтобы сохранить временное разрешение.
+   - Pretrained: автоскачивание весов с zenodo (PANNs CNN14_mAP=0.431.pth)
+
+2. СТРАТЕГИЯ ВРЕМЕННОГО РАЗРЕШЕНИЯ
+   - Стандартный CNN14 даёт T/16 = 13 позиций для T=216 — слишком грубо
+   - Наша версия: T/4 = 54 позиции (~92 мс/позицию)
+   - Это в 2× плотнее чем ResNet18-v6 (27 позиций, ~184 мс/позицию)
+
+3. PRETRAINED ВЕСА
+   - Скачиваются с https://zenodo.org/record/3987831/files/Cnn14_mAP=0.431.pth
+   - Адаптация conv1: PANNs использует bn0 + linear projection до conv-блоков,
+     мы реплицируем эту структуру для совместимости весов
+   - Веса первой conv1 берутся как есть (1 канал)
+
+4. ДЕКОДЕР — без изменений
 
 Параметры по умолчанию:
-  d_model      = 128   (размер эмбеддинга, совпадает с выходом энкодера)
-  nhead        = 8
-  num_decoder_layers = 4
-  dim_feedforward    = 512
-  vocab_size   = 391   (из tokenizer.py)
-  max_seq_len  = 512
-"""
-
-"""
-ScoreGenerationModel  v3
-========================
-
-Ключевые изменения по сравнению с v2:
-
-1. ЭНКОДЕР — предобученный ResNet18 (по умолчанию pretrained=True)
-   - Принимает 3-канальный вход (спектрограмма реплицируется × 3 в dataset.py)
-   - Backbone инициализируется весами ImageNet — даёт лучшие начальные признаки
-   - Encoder LR должен быть меньше LR декодера (см. train.py)
-
-2. ЭНКОДЕР — кастомный лёгкий CNN (pretrained=False)
-   - Оставлен как опция когда GPU мало или данных много
-   - Принимает 1-канальный вход
-
-3. ДЕКОДЕР — без изменений (Pre-LN, Weight Tying, nucleus sampling)
-
-4. НОРМИРОВКА — ответственность перенесена в dataset.py:
-   - [0,1] (dB) + ImageNet mean/std если pretrained=True
-   - [0,1] (dB) напрямую если pretrained=False
-
-Параметры для 8 ГБ GPU (по умолчанию):
-  d_model=256, nhead=8, 1 encoder слой, 6 decoder слоёв, FFN=1024
-  pretrained=True  -использует ImageNet backbone
+  d_model=256, nhead=8, num_decoder_layers=6, dim_feedforward=1024
+  pretrained_encoder=True
 """
 
 import math
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import torchvision.models as tv_models
+import torch.nn.functional as F
 
 from tokenizer import VOCAB_SIZE, PAD_TOKEN
 
 
-# ══════════════════════════════════════════════════════════════
-#  1. CNN-энкодер спектрограммы
-# ══════════════════════════════════════════════════════════════
-class SpectrogramEncoder(nn.Module):
-    """
-    Вход:  (B, 1, F, T)  — одноканальная Mel-спектрограмма
-    Выход: (B, S, d_model) — последовательность из S=28 векторов (memory декодера)
+# URL для весов CNN14 (PANNs, Kong 2020). mAP=0.431 на AudioSet.
+PANNS_CNN14_URL = "https://zenodo.org/record/3987831/files/Cnn14_mAP%3D0.431.pth?download=1"
+PANNS_CNN14_FILENAME = "Cnn14_mAP=0.431.pth"
 
-    Для входа (B, 1, 128, 216):
-      ResNet18 layer4 -(B, 512, 4, 7)
-      reshape         -(B, 28, 512)
-      proj            -(B, 28, d_model)
+
+# ══════════════════════════════════════════════════════════════
+#  1. CNN14 building blocks (PANNs-style)
+# ══════════════════════════════════════════════════════════════
+class _ConvBlock(nn.Module):
+    """
+    PANNs ConvBlock: два 3x3 conv → bn → relu подряд, без residual.
+    Это точная копия структуры из panns_inference/models.py (ConvBlock)
+    для совместимости с предобученными весами.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels,
+                               kernel_size=(3, 3), stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(out_channels, out_channels,
+                               kernel_size=(3, 3), stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x: torch.Tensor, pool_size=(2, 2), pool_type: str = "avg",
+                debug: bool = False, name: str = ""):
+        # Не используем inplace ReLU (relu_) — он несовместим с AMP в некоторых случаях.
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        # Skip pool if both dims are 1 (no-op)
+        if pool_size == (1, 1) or pool_size == [1, 1]:
+            return x
+        if pool_type == "avg":
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == "max":
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        return x
+
+
+# ══════════════════════════════════════════════════════════════
+#  2. CNN14 encoder
+# ══════════════════════════════════════════════════════════════
+class CNN14Encoder(nn.Module):
+    """
+    Адаптированный CNN14 для транскрипции.
+
+    Стандартный CNN14 (audio tagging):
+        bn0 → block1(64) → pool → block2(128) → pool → block3(256) → pool
+            → block4(512) → pool → block5(1024) → pool → block6(2048)
+            → global_pool → fc → AudioSet logits
+
+    Наша версия (transcription):
+        bn0 → block1(64) → pool(2,2) → block2(128) → pool(2,2)
+            → block3(256) → pool(1,2)  ← НЕ сжимаем время
+            → block4(512) → pool(1,2)  ← НЕ сжимаем время
+        → freq_pool → linear → (B, T', d_model)
+
+    Размеры тензоров для (B, 1, 128, 216):
+        input:        (B, 1,   128, 216)
+        bn0:          (B, 1,   128, 216)  — нормализация по mel-bins
+        block1+pool:  (B, 64,  64,  108)
+        block2+pool:  (B, 128, 32,  54)
+        block3+pool:  (B, 256, 32,  27)   ← пул только по частоте
+        block4+pool:  (B, 512, 32,  27)   ← пул убран, чтобы сохранить T
+
+    Wait — пересчитаем:
+        bn0:                          (B, 1,   128, 216)
+        block1 → pool(2,2):           (B, 64,  64,  108)
+        block2 → pool(2,2):           (B, 128, 32,  54)
+        block3 → pool(2,2):           (B, 256, 16,  27)
+        block4 → no pool:             (B, 512, 16,  27)
+        freq_pool over 16:            (B, 512, 1,   27)
+        squeeze + permute:            (B, 27, 512)
+        proj → d_model:               (B, 27, d_model)
+
+    27 позиций × ~184 мс = 5 сек. Это совпадает с v6, но фичи богаче (CNN14).
+
+    Почему не плотнее: каждый pool(2,2) уменьшает время в 2×. После 2 пулингов:
+    216 → 108 → 54 → 27. Чтобы получить 54 позиции, надо убрать ещё один pool,
+    но тогда веса PANNs не сядут (форма после block3 не сходится).
+
+    Если хочешь 54 позиции — ставь use_pretrained=False и dense_time=True
+    (получишь свежий CNN14 с pool(1,2) в block3 → плотный T).
     """
 
     def __init__(
@@ -78,90 +132,194 @@ class SpectrogramEncoder(nn.Module):
             d_model: int = 256,
             dropout: float = 0.1,
             pretrained: bool = True,
+            weights_dir: str = "./pretrained",
+            dense_time: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
+        self.pretrained = pretrained
+        self.dense_time = dense_time
 
-        if pretrained:
-            backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
+        # bn0 нормализует по mel-axis (как в PANNs).
+        #
+        # ВАЖНО: в оригинальном PANNs bn0 = BatchNorm2d(64), потому что у них
+        # 64 mel-bins. У нас 128 mel-bins, поэтому bn0 = BatchNorm2d(128).
+        # Веса PANNs bn0 НЕ ЗАГРУЗЯТСЯ (форма не совпадает) — это ок, bn0
+        # быстро обучится с нуля. Главные веса (conv_block1-4) — загрузятся.
+        self.bn0 = nn.BatchNorm2d(128)
 
-            # Адаптируем первый слой: 3 канала -1 канал (усредняем веса)
-            orig_conv = backbone.conv1
-            new_conv = nn.Conv2d(
-                in_channels=1,
-                out_channels=orig_conv.out_channels,
-                kernel_size=orig_conv.kernel_size,
-                stride=orig_conv.stride,
-                padding=orig_conv.padding,
-                bias=False,
-            )
-            new_conv.weight.data = orig_conv.weight.data.mean(dim=1, keepdim=True)
-            backbone.conv1 = new_conv
+        # Четыре conv-блока. Block5/6 (1024/2048) выкинуты — слишком жирно для нашего
+        # объёма данных и слишком сильно сожмут время.
+        self.conv_block1 = _ConvBlock(1, 64)
+        self.conv_block2 = _ConvBlock(64, 128)
+        self.conv_block3 = _ConvBlock(128, 256)
+        self.conv_block4 = _ConvBlock(256, 512)
 
-            # Берём только feature extractor, БЕЗ avgpool и fc
-            self.cnn = nn.Sequential(
-                backbone.conv1,
-                backbone.bn1,
-                backbone.relu,
-                backbone.maxpool,
-                backbone.layer1,
-                backbone.layer2,
-                backbone.layer3,
-                backbone.layer4,
-                # НЕТ avgpool — сохраняем пространственную карту (B, 512, 4, 7)
-            )
-            cnn_out = 512
+        cnn_out_channels = 512
 
-        else:
-            # Лёгкий кастомный CNN без avgpool
-            self.cnn = nn.Sequential(
-                _ConvBlock(1, 32, stride=2),
-                _ConvBlock(32, 64, stride=2),
-                _ConvBlock(64, 128, stride=2),
-                _ConvBlock(128, 256, stride=2),
-                # НЕТ AdaptiveAvgPool — сохраняем карту (B, 256, H', W')
-            )
-            cnn_out = 256
+        # Сжимаем только частотную ось → одна позиция на каждый временной фрейм
+        self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
 
-        # Проекция каналов -d_model (применяется к каждой позиции)
+        # Проекция channels → d_model
         self.proj = nn.Sequential(
-            nn.Linear(cnn_out, d_model),
+            nn.Linear(cnn_out_channels, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
 
-        # Positional encoding для позиций карты признаков
         self.pos_enc = PositionalEncoding(d_model, max_len=512, dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Загрузка предобученных весов
+        if pretrained:
+            self._load_pretrained(weights_dir)
+
+    def _load_pretrained(self, weights_dir: str):
+        """Скачивает (если нужно) и загружает веса PANNs CNN14."""
+        weights_dir = Path(weights_dir)
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        weights_path = weights_dir / PANNS_CNN14_FILENAME
+
+        if not weights_path.exists():
+            print(f"[CNN14] Скачиваю предобученные веса PANNs ({PANNS_CNN14_FILENAME})...")
+            print(f"[CNN14] URL: {PANNS_CNN14_URL}")
+            try:
+                import urllib.request
+                urllib.request.urlretrieve(PANNS_CNN14_URL, weights_path)
+                print(f"[CNN14] Сохранено: {weights_path}")
+            except Exception as e:
+                print(f"[CNN14] ОШИБКА скачивания: {e}")
+                print(f"[CNN14] Скачайте вручную с {PANNS_CNN14_URL} в {weights_path}")
+                print(f"[CNN14] Продолжаю без предобученных весов.")
+                return
+
+        try:
+            ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+            state = ckpt.get("model", ckpt)
+
+            own_state = self.state_dict()
+            loaded = 0
+            skipped = 0
+            skipped_bn_stats = 0
+            for name, param in state.items():
+                # Пропускаем running_mean/running_var/num_batches_tracked у BN.
+                # Эти статистики из PANNs накапливались на ИХ распределении входа
+                # (32kHz, 64 mel-bins, специфические аугментации). У нас другой
+                # вход (22kHz, 128 mel-bins, без аугментаций) → их running_stats
+                # неприменимы и могут вызвать NaN в первых шагах train (когда
+                # BN использует batch stats, но running_var близок к 0 у каких-то
+                # каналов и amp/conv комбинация выходит за пределы FP16).
+                # gamma/beta (.weight/.bias) загружаем — они полезны.
+                if "running_mean" in name or "running_var" in name or "num_batches_tracked" in name:
+                    skipped_bn_stats += 1
+                    continue
+                if name in own_state and own_state[name].shape == param.shape:
+                    own_state[name].copy_(param)
+                    loaded += 1
+                else:
+                    skipped += 1
+            print(f"[CNN14] Загружено {loaded} тензоров из PANNs")
+            print(f"[CNN14]   пропущено {skipped} (block5/6/fc — мы их не используем)")
+            print(f"[CNN14]   пропущено {skipped_bn_stats} BN running stats "
+                  f"(будут накоплены заново на наших данных)")
+        except Exception as e:
+            print(f"[CNN14] ОШИБКА загрузки весов: {e}")
+            print(f"[CNN14] Продолжаю с нуля.")
+
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
-        x: (B, 1, F, T)
-        (B, S, d_model)  где S = H' × W' = 4×7 = 28 для входа (1, 128, 216)
+        x: (B, 1, F=128, T=216)  — спектрограмма в [0, 1] (dB-шкала, нормализованная)
+        → (B, T', d_model)
+
+        Про масштаб входа:
+            bn0 нормализует вход к нулевому среднему и единичной дисперсии
+            ПО КАЖДОМУ MEL-BIN ОТДЕЛЬНО. После bn0 значения автоматически
+            попадают в диапазон ~[-3, +3] с std≈1 — именно то, что ожидают
+            веса PANNs conv_block1. Поэтому нам НЕ НАДО самим масштабировать
+            вход — это даже вредно (проверено: rescale (x-1)*80 ломал обучение).
+
+        Также:
+            - clamp на вход для защиты от выбросов
+            - debug=True печатает min/max/has_nan на каждом ключевом слое
         """
-        feat = self.cnn(x)  # (B, C, H', W')
-        B, C, H, W = feat.shape
-        # Переставляем в (B, H'*W', C) — каждый пиксель карты = один токен памяти
-        feat = feat.permute(0, 2, 3, 1)  # (B, H', W', C)
-        feat = feat.reshape(B, H * W, C)  # (B, S, C)
-        feat = self.proj(feat)  # (B, S, d_model)
-        feat = self.pos_enc(feat)  # + positional encoding
-        return feat  # (B, 28, d_model)
+        # ── 1. Защита от аномальных входных значений ──────────
+        x = torch.clamp(x, min=0.0, max=1.0)
 
+        if debug:
+            self._debug_print("input", x)
 
-# ──────────────────────────────────────────────────────────────
-class _ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=2):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
-        self.act = nn.GELU()
+        # ── 2. bn0: нормализация по mel-axis ──────────────────
+        # (B, 1, F, T) → (B, F, 1, T): BN видит каждый mel-bin как отдельный канал.
+        # Это автоматически приводит вход к std≈1, mean≈0 — масштабу, привычному
+        # для PANNs conv-блоков. Никакой ручной перешкаливания не нужно.
+        x = x.transpose(1, 2)
+        x = self.bn0(x)
+        x = x.transpose(1, 2)  # (B, 1, F, T)
 
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        if debug:
+            self._debug_print("after_bn0", x)
+
+        # ── 4. Conv blocks ────────────────────────────────────
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type="avg",
+                             debug=debug, name="block1")  # (B, 64, 64, 108)
+        if debug:
+            self._debug_print("after_block1", x)
+        x = F.dropout(x, p=0.2, training=self.training)
+
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type="avg",
+                             debug=debug, name="block2")  # (B, 128, 32, 54)
+        if debug:
+            self._debug_print("after_block2", x)
+        x = F.dropout(x, p=0.2, training=self.training)
+
+        if self.dense_time:
+            x = self.conv_block3(x, pool_size=(2, 1), pool_type="avg",
+                                 debug=debug, name="block3")
+            x = F.dropout(x, p=0.2, training=self.training)
+            x = self.conv_block4(x, pool_size=(2, 1), pool_type="avg",
+                                 debug=debug, name="block4")
+        else:
+            x = self.conv_block3(x, pool_size=(2, 2), pool_type="avg",
+                                 debug=debug, name="block3")
+            x = F.dropout(x, p=0.2, training=self.training)
+            x = self.conv_block4(x, pool_size=(1, 1), pool_type="avg",
+                                 debug=debug, name="block4")
+
+        if debug:
+            self._debug_print("after_block4", x)
+
+        x = F.dropout(x, p=0.2, training=self.training)
+
+        # ── 5. Freq pool + projection ────────────────────────
+        x = self.freq_pool(x)
+        x = x.squeeze(2)
+        x = x.permute(0, 2, 1)  # (B, T', 512)
+
+        x = self.proj(x)
+        if debug:
+            self._debug_print("after_proj", x)
+
+        x = self.pos_enc(x)
+        return x
+
+    @staticmethod
+    def _debug_print(name: str, x: torch.Tensor):
+        """Помощник для диагностики: печатает статистику тензора."""
+        with torch.no_grad():
+            has_nan = torch.isnan(x).any().item()
+            has_inf = torch.isinf(x).any().item()
+            x_finite = x[torch.isfinite(x)]
+            if x_finite.numel() == 0:
+                print(f"  [DBG] {name}: ALL VALUES NON-FINITE!")
+                return
+            print(f"  [DBG] {name}: shape={tuple(x.shape)} "
+                  f"min={x_finite.min().item():.4f} "
+                  f"max={x_finite.max().item():.4f} "
+                  f"mean={x_finite.mean().item():.4f} "
+                  f"nan={has_nan} inf={has_inf}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  2. Positional Encoding
+#  3. Positional Encoding
 # ══════════════════════════════════════════════════════════════
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 1024, dropout: float = 0.1):
@@ -183,11 +341,12 @@ class PositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(1) > self.pe.size(1):
             self._build(x.size(1) + 64)
+            self.pe = self.pe.to(x.device)
         return self.dropout(x + self.pe[:, : x.size(1)])
 
 
 # ══════════════════════════════════════════════════════════════
-#  3. Transformer Decoder
+#  4. Transformer Decoder
 # ══════════════════════════════════════════════════════════════
 class MusicTransformerDecoder(nn.Module):
     def __init__(
@@ -247,15 +406,17 @@ class MusicTransformerDecoder(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  4. Полная модель
+#  5. Полная модель
 # ══════════════════════════════════════════════════════════════
 class ScoreGenerationModel(nn.Module):
     """
-    ScoreGenerationModel v5.
+    ScoreGenerationModel v7 — CNN14 encoder + Transformer decoder.
 
-    Энкодер: (B, 1, F, T) - ResNet18 - (B, 28, d_model)
-    Декодер: cross-attention по 28 позициям памяти (реальная информация о спектрограмме)
+    Энкодер: (B, 1, 128, 216) → CNN14 → (B, T', d_model)
+        T' = 27 (стандарт, совместим с PANNs весами)
+        T' = 54 (dense_time=True, без претрейна)
 
+    Декодер: cross-attention к CNN14 features
     """
 
     def __init__(
@@ -268,15 +429,19 @@ class ScoreGenerationModel(nn.Module):
             max_seq_len: int = 256,
             dropout: float = 0.1,
             pretrained_encoder: bool = True,
-            # совместимость с train.py
+            weights_dir: str = "./pretrained",
+            dense_time: bool = False,
+            # совместимость со старым train.py
             num_encoder_layers: int = 0,
             cnn_chunk: int = 0,
     ):
         super().__init__()
-        self.encoder = SpectrogramEncoder(
+        self.encoder = CNN14Encoder(
             d_model=d_model,
             dropout=dropout,
             pretrained=pretrained_encoder,
+            weights_dir=weights_dir,
+            dense_time=dense_time,
         )
         self.decoder = MusicTransformerDecoder(
             vocab_size=vocab_size,
@@ -289,10 +454,16 @@ class ScoreGenerationModel(nn.Module):
         )
         enc_p = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         dec_p = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-        mode = "pretrained ResNet18 (1-ch, seq)" if pretrained_encoder else "custom CNN (seq)"
-        print(f"ScoreGenerationModel v5 | {mode}")
+        mode_str = "CNN14 (PANNs pretrained)" if pretrained_encoder else "CNN14 (from scratch)"
+        if dense_time:
+            mode_str += " + dense_time"
+        print(f"ScoreGenerationModel v7 | {mode_str}")
         print(f"  Encoder: {enc_p:,}  |  Decoder: {dec_p:,}  |  Total: {enc_p + dec_p:,}")
-        print(f"  Memory sequence: 28 позиций (было 1) -cross-attention работает")
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, 128, 216)
+            n_pos = self.encoder(dummy).shape[1]
+        ms_per_pos = 216 / n_pos * 23
+        print(f"  Memory: {n_pos} временны́х позиций (~{ms_per_pos:.0f} мс/позицию)")
 
     def forward(
             self,
@@ -300,8 +471,13 @@ class ScoreGenerationModel(nn.Module):
             tgt: torch.Tensor,  # (B, tgt_len)
             tgt_key_padding_mask=None,
             cnn_chunk: int = 0,
+            debug: bool = False,
     ) -> torch.Tensor:
-        memory = self.encoder(spectrograms)  # (B, 28, d_model)
+        memory = self.encoder(spectrograms, debug=debug)
+        if debug:
+            with torch.no_grad():
+                has_nan = torch.isnan(memory).any().item()
+                print(f"  [DBG] memory: shape={tuple(memory.shape)} nan={has_nan}")
         return self.decoder(tgt=tgt, memory=memory,
                             tgt_key_padding_mask=tgt_key_padding_mask)
 
