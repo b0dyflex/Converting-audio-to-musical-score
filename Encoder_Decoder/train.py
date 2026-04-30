@@ -51,6 +51,57 @@ from dataset import MidiSpectrogramDataset
 from tokenizer import PAD_TOKEN, VOCAB_SIZE
 from metrics import NoteF1Stats
 
+
+# ══════════════════════════════════════════════════════════════
+#  Group-aware train/val split (по MIDI-файлам, а не сегментам)
+# ══════════════════════════════════════════════════════════════
+def split_by_file(dataset: MidiSpectrogramDataset, val_ratio: float, seed: int = 42):
+    """
+    Делит датасет на train/val ПО MIDI-ФАЙЛАМ:
+        все сегменты одного файла попадают либо в train, либо в val.
+
+    Это устраняет data leakage из-за random_split по сегментам, при котором
+    соседние секунды одного произведения оказывались в разных split'ах.
+
+    Args:
+        dataset: MidiSpectrogramDataset с атрибутом .samples (список Path)
+        val_ratio: доля файлов в val
+        seed: для воспроизводимости
+
+    Returns:
+        (train_indices, val_indices, n_train_files, n_val_files)
+    """
+    import re
+    import random
+    from collections import defaultdict
+
+    # Группируем индексы сегментов по file_id
+    file_to_indices: dict[str, list[int]] = defaultdict(list)
+    for idx, sample_path in enumerate(dataset.samples):
+        m = re.match(r"sample_(\d+)_(\d+)", sample_path.name)
+        if m:
+            file_id = m.group(1)
+        else:
+            # Fallback: имя без расширения
+            file_id = sample_path.name
+        file_to_indices[file_id].append(idx)
+
+    # Перемешиваем файлы и делим
+    file_ids = sorted(file_to_indices.keys())
+    rng = random.Random(seed)
+    rng.shuffle(file_ids)
+
+    n_files = len(file_ids)
+    n_val_files = max(1, int(n_files * val_ratio))
+    val_file_ids = set(file_ids[:n_val_files])
+    train_file_ids = set(file_ids[n_val_files:])
+
+    train_indices = [i for fid in train_file_ids for i in file_to_indices[fid]]
+    val_indices = [i for fid in val_file_ids for i in file_to_indices[fid]]
+
+    return train_indices, val_indices, len(train_file_ids), len(val_file_ids)
+
+
 # ══════════════════════════════════════════════════════════════
 #  Конфигурация
 # ══════════════════════════════════════════════════════════════
@@ -64,14 +115,14 @@ CONFIG = dict(
     max_time_steps=216,
     max_samples=0,
 
-    # Архитектура (CNN14)
+    # Архитектура (CNN14) — уменьшена для борьбы с overfitting
     d_model=256,
     nhead=8,
-    num_decoder_layers=6,
-    dim_feedforward=1024,
-    dropout=0.1,
+    num_decoder_layers=4,        # было 6 → меньше параметров, меньше overfitting
+    dim_feedforward=768,         # было 1024
+    dropout=0.3,                 # было 0.1 → главный рычаг регуляризации для transformer
     pretrained_encoder=True,
-    dense_time=False,            # True = 54 позиции, но без претрейна
+    dense_time=False,
 
     # Обучение
     batch_size=8,
@@ -82,7 +133,7 @@ CONFIG = dict(
     lr_decoder=3e-4,
     lr_encoder=5e-5,
 
-    weight_decay=1e-2,
+    weight_decay=5e-2,           # было 1e-2 → сильнее регуляризация
     warmup_steps=400,
     grad_clip=1.0,
     val_ratio=0.1,
@@ -104,10 +155,23 @@ CONFIG = dict(
     onset_tolerance_ms=50,
     train_f1_every=200,          # считать F1 на train каждые N step (0 = не считать)
 
+    # SpecAugment (аугментация спектрограмм для борьбы с overfitting)
+    specaug_enabled=True,        # включить случайное маскирование time/freq полос
+    specaug_n_time_masks=2,      # сколько time-полос маскировать
+    specaug_time_mask_param=20,  # макс. ширина time-маски в фреймах (~20*23=460мс)
+    specaug_n_freq_masks=2,      # сколько freq-полос маскировать
+    specaug_freq_mask_param=15,  # макс. ширина freq-маски в mel-bins
+
     # Mixed precision / отладка
     use_amp=True,                # False = отключить mixed precision (для отладки NaN)
     amp_dtype="bfloat16",        # "bfloat16" (рекомендовано для CNN14) или "float16"
     debug_first_batch=True,      # печатать статистику активаций на первом батче
+
+    # Split (anti-leakage)
+    split_seed=42,               # seed для group-split по MIDI-файлам
+
+    # Early stopping
+    patience=8,                  # эпох без улучшения val_loss до остановки (0 = выкл.)
 )
 
 
@@ -265,20 +329,80 @@ class GradMonitor:
 
 
 # ══════════════════════════════════════════════════════════════
+#  SpecAugment (Park et al., 2019) — аугментация спектрограмм
+# ══════════════════════════════════════════════════════════════
+def spec_augment(
+        spec: torch.Tensor,
+        n_time_masks: int = 2,
+        time_mask_param: int = 20,
+        n_freq_masks: int = 2,
+        freq_mask_param: int = 15,
+) -> torch.Tensor:
+    """
+    Применяет SpecAugment к батчу спектрограмм.
+    Маскирует случайные time/freq полосы → модель не может полагаться
+    на конкретные узкие частотные диапазоны или временные позиции.
+
+    Args:
+        spec: (B, 1, F, T) — мел-спектрограмма
+        n_time_masks: количество time-полос для маскирования
+        time_mask_param: максимальная ширина time-маски (фреймов)
+        n_freq_masks: количество freq-полос
+        freq_mask_param: максимальная ширина freq-маски (mel-bins)
+
+    Returns:
+        spec с маскированными полосами (заменены на 0 = тишина в нашей нормировке)
+    """
+    if spec.dim() != 4:
+        return spec
+    B, C, F, T = spec.shape
+
+    # Time masks
+    for _ in range(n_time_masks):
+        t = torch.randint(0, time_mask_param + 1, (B,), device=spec.device)
+        t0 = (torch.rand(B, device=spec.device) * (T - t.float()).clamp(min=1)).long()
+        for b in range(B):
+            if t[b] > 0:
+                spec[b, :, :, t0[b]:t0[b] + t[b]] = 0.0
+
+    # Frequency masks
+    for _ in range(n_freq_masks):
+        f = torch.randint(0, freq_mask_param + 1, (B,), device=spec.device)
+        f0 = (torch.rand(B, device=spec.device) * (F - f.float()).clamp(min=1)).long()
+        for b in range(B):
+            if f[b] > 0:
+                spec[b, :, f0[b]:f0[b] + f[b], :] = 0.0
+
+    return spec
+
+
+# ══════════════════════════════════════════════════════════════
 #  Шаг обучения
 # ══════════════════════════════════════════════════════════════
 def train_step(model, batch, criterion, scaler, device, accum_steps, step_idx,
                return_preds: bool = False, use_amp: bool = True,
-               amp_dtype=None, debug: bool = False):
+               amp_dtype=None, debug: bool = False,
+               specaug_cfg: dict = None):
     """
     Возвращает (loss, acc, do_update, preds_or_None).
     use_amp=False → отключает mixed precision (полезно для отладки NaN).
-    amp_dtype: torch.float16 или torch.bfloat16. bfloat16 рекомендован для CNN
-        с большими активациями (например, CNN14) — он имеет тот же диапазон,
-        что float32, и не подвержен overflow.
+    amp_dtype: torch.float16 или torch.bfloat16.
+    specaug_cfg: dict с параметрами SpecAugment, или None (без аугментации).
     debug=True → печатает статистику активаций каждого слоя энкодера.
     """
     specs, src, tgt, pad_mask = [t.to(device) for t in batch]
+
+    # ── Применяем SpecAugment (только в train mode, model сам train()) ────
+    if specaug_cfg is not None and model.training:
+        # Клонируем, чтобы не модифицировать данные в DataLoader
+        specs = specs.clone()
+        specs = spec_augment(
+            specs,
+            n_time_masks=specaug_cfg.get("n_time_masks", 2),
+            time_mask_param=specaug_cfg.get("time_mask_param", 20),
+            n_freq_masks=specaug_cfg.get("n_freq_masks", 2),
+            freq_mask_param=specaug_cfg.get("freq_mask_param", 15),
+        )
 
     if debug:
         with torch.no_grad():
@@ -377,14 +501,33 @@ def train(cfg: dict):
         silence_threshold=cfg.get("silence_threshold", 0.01),
     )
 
+    # ── Group-split по MIDI-файлам (anti-leakage) ────────────
+    # Все сегменты одного файла попадают целиком в train ИЛИ в val.
+    # Без этого сегменты одной пьесы попадают и туда и туда → лик контекста.
+    split_seed = cfg.get("split_seed", 42)
+    train_indices, val_indices, n_train_files, n_val_files = split_by_file(
+        full_dataset, val_ratio=cfg["val_ratio"], seed=split_seed,
+    )
+    print(f"Split по файлам (seed={split_seed}): "
+          f"{n_train_files} train-файлов, {n_val_files} val-файлов")
+
+    # Применяем max_samples ПОСЛЕ split, чтобы val оставался корректным
     max_samples = cfg.get("max_samples", 0)
-    if max_samples > 0 and max_samples < len(full_dataset):
-        from torch.utils.data import Subset
-        full_dataset = Subset(full_dataset, list(range(max_samples)))
-        print(f"Датасет ограничен: {max_samples}")
-    n_val = max(1, int(len(full_dataset) * cfg["val_ratio"]))
-    n_train = len(full_dataset) - n_val
-    train_ds, val_ds = random_split(full_dataset, [n_train, n_val])
+    if max_samples > 0:
+        n_val_keep = max(1, int(max_samples * cfg["val_ratio"]))
+        n_train_keep = max_samples - n_val_keep
+        if n_train_keep < len(train_indices):
+            train_indices = train_indices[:n_train_keep]
+        if n_val_keep < len(val_indices):
+            val_indices = val_indices[:n_val_keep]
+        print(f"max_samples: train усечён до {len(train_indices)}, "
+              f"val до {len(val_indices)}")
+
+    from torch.utils.data import Subset
+    train_ds = Subset(full_dataset, train_indices)
+    val_ds = Subset(full_dataset, val_indices)
+    n_train = len(train_ds)
+    n_val = len(val_ds)
 
     _nw = 0 if sys.platform == "win32" else 2
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
@@ -493,6 +636,27 @@ def train(cfg: dict):
     train_f1_every = cfg.get("train_f1_every", 0)
     debug_first_batch = cfg.get("debug_first_batch", True)
 
+    # Early stopping
+    patience = cfg.get("patience", 0)
+    epochs_without_improvement = 0
+    if patience > 0:
+        print(f"Early stopping: patience={patience} эпох без улучшения val_loss")
+
+    # Конфиг SpecAugment
+    specaug_cfg = None
+    if cfg.get("specaug_enabled", False):
+        specaug_cfg = {
+            "n_time_masks": cfg.get("specaug_n_time_masks", 2),
+            "time_mask_param": cfg.get("specaug_time_mask_param", 20),
+            "n_freq_masks": cfg.get("specaug_n_freq_masks", 2),
+            "freq_mask_param": cfg.get("specaug_freq_mask_param", 15),
+        }
+        print(f"SpecAugment: time={specaug_cfg['n_time_masks']}×"
+              f"≤{specaug_cfg['time_mask_param']}, freq="
+              f"{specaug_cfg['n_freq_masks']}×≤{specaug_cfg['freq_mask_param']}")
+    else:
+        print(f"SpecAugment: OFF")
+
     for epoch in range(start_epoch, cfg["num_epochs"]):
         ep_loss, ep_acc = 0.0, 0.0
         ep_valid_steps = 0
@@ -516,6 +680,7 @@ def train(cfg: dict):
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
                 debug=do_debug,
+                specaug_cfg=specaug_cfg,
             )
             if do_debug:
                 print("  ━━━━━ end DEBUG ━━━━━\n")
@@ -621,9 +786,14 @@ def train(cfg: dict):
         # ── Сохранение ───────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             save_m = ema.get_model() if ema else model
             torch.save(save_m.state_dict(), out_dir / "best_model.pt")
             print(f"  * Лучшая модель по loss (val_loss={val_loss:.4f})")
+        else:
+            epochs_without_improvement += 1
+            if patience > 0:
+                print(f"  · val_loss не улучшен ({epochs_without_improvement}/{patience})")
 
         # Отдельно сохраняем лучшую по onset_f1 — это финальная метрика качества
         if val_of1 > best_val_f1:
@@ -644,6 +814,14 @@ def train(cfg: dict):
             if ema:
                 ckpt_data["ema"] = ema.shadow.state_dict()
             torch.save(ckpt_data, ckpt_path)
+
+        # ── Early stopping ──────────────────────────────────
+        if patience > 0 and epochs_without_improvement >= patience:
+            print(f"\n  ━━ EARLY STOPPING ━━")
+            print(f"  val_loss не улучшался {patience} эпох подряд.")
+            print(f"  Лучший val_loss: {best_val_loss:.4f}, val_onset_f1: {best_val_f1:.4f}")
+            print(f"  Остановка на эпохе {epoch + 1}.")
+            break
 
     print("Обучение завершено!")
 
