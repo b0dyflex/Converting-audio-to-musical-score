@@ -41,13 +41,22 @@ def plot_training(
     save_dir: str,
     best_epoch: int = None,
     best_loss: float = None,
+    train_accs: list = None,
+    val_accs: list = None,
+    train_f1s: list = None,
+    val_f1s: list = None,
+    train_perplexities: list = None,
+    val_perplexities: list = None,
+    train_top5_accs: list = None,
+    val_top5_accs: list = None,
 ):
     """
     Строит дашборд обучения и сохраняет training_plot.png в save_dir.
 
-    Компоновка (2 строки × 3 столбца):
-      [0,0] Train loss по эпохам       [0,1] Train vs Val loss      [0,2] Лог-масштаб
-      [1,0] Δ Loss (бар-чарт)          [1,1] Скользящее среднее     [1,2] Карточка лучшей эпохи
+    Компоновка (3 строки × 3 столбца):
+      [0,0] Train vs Val Loss     [0,1] Log Loss        [0,2] Δ Loss
+      [1,0] Accuracy              [1,1] F1 Score        [1,2] Perplexity
+      [2,0] Top-5 Accuracy        [2,1] Скользящее ср.  [2,2] Карточка лучшей эпохи
     """
     try:
         import matplotlib
@@ -64,171 +73,209 @@ def plot_training(
         print("⚠ Нет данных для построения графика.")
         return None
 
-    epochs    = list(range(1, len(train_losses) + 1))
-    has_val   = len(val_losses) > 0 and any(v > 0 for v in val_losses)
+    epochs     = list(range(1, len(train_losses) + 1))
+    has_val    = bool(val_losses) and any(v > 0 for v in val_losses)
     val_epochs = list(range(1, len(val_losses) + 1)) if has_val else []
 
-    # Вычисляем best_loss если не передан
+    # Вычисляем best_loss / best_epoch если не переданы
     if best_loss is None:
         best_loss = min(val_losses) if has_val else min(train_losses)
     if best_epoch is None:
-        if has_val:
-            best_epoch = int(np.argmin(val_losses)) + 1
-        else:
-            best_epoch = int(np.argmin(train_losses)) + 1
+        best_epoch = int(np.argmin(val_losses if has_val else train_losses)) + 1
 
     def moving_avg(data, window=3):
         if len(data) < window:
             return list(data)
         return list(np.convolve(data, np.ones(window) / window, mode="valid"))
 
+    def _ep(data):
+        """Эпохи для произвольного списка (может быть None или []). """
+        return list(range(1, len(data) + 1)) if data else []
+
     # ── Палитра ──────────────────────────────────────────────────────
-    BG_MAIN   = "#0d0d1a"
-    BG_PANEL  = "#13132b"
-    BG_CARD   = "#1a1a3a"
-    C_TRAIN   = "#4fc3f7"   # голубой
-    C_VAL     = "#f48fb1"   # розовый
-    C_MA      = "#fff176"   # жёлтый (MA)
-    C_BEST    = "#69f0ae"   # зелёный (маркер best)
-    C_POS     = "#ef9a9a"   # красный (loss растёт)
-    C_NEG     = "#a5d6a7"   # зелёный (loss падает)
-    C_GRID    = "#1e1e3f"
-    C_TEXT    = "#e0e0e0"
-    C_MUTED   = "#888899"
+    BG_MAIN  = "#0d0d1a"
+    BG_PANEL = "#13132b"
+    BG_CARD  = "#1a1a3a"
+    C_TRAIN  = "#4fc3f7"
+    C_VAL    = "#f48fb1"
+    C_MA     = "#fff176"
+    C_BEST   = "#69f0ae"
+    C_POS    = "#ef9a9a"
+    C_NEG    = "#a5d6a7"
+    C_GRID   = "#1e1e3f"
+    C_TEXT   = "#e0e0e0"
+    C_MUTED  = "#888899"
 
-    # ── Фигура ───────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(18, 10))
+    # ── Фигура 3×3 ───────────────────────────────────────────────────
+    fig = plt.figure(figsize=(20, 14))
     fig.patch.set_facecolor(BG_MAIN)
-    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.48, wspace=0.32,
-                            left=0.06, right=0.97, top=0.91, bottom=0.08)
+    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.52, wspace=0.32,
+                            left=0.06, right=0.97, top=0.92, bottom=0.06)
 
-    def style(ax, title, xlabel="Эпоха", ylabel="Loss"):
+    def style(ax, title, xlabel="Эпоха", ylabel=""):
         ax.set_facecolor(BG_PANEL)
-        ax.set_title(title, color=C_TEXT, fontsize=10.5, pad=7, fontweight="bold")
-        ax.set_xlabel(xlabel, color=C_MUTED, fontsize=8.5)
-        ax.set_ylabel(ylabel, color=C_MUTED, fontsize=8.5)
-        ax.tick_params(colors=C_TEXT, labelsize=8)
+        ax.set_title(title, color=C_TEXT, fontsize=10, pad=6, fontweight="bold")
+        ax.set_xlabel(xlabel, color=C_MUTED, fontsize=8)
+        if ylabel:
+            ax.set_ylabel(ylabel, color=C_MUTED, fontsize=8)
+        ax.tick_params(colors=C_TEXT, labelsize=7.5)
         ax.grid(color=C_GRID, linestyle="--", linewidth=0.6, alpha=0.8)
         for sp in ax.spines.values():
             sp.set_edgecolor(C_GRID)
 
     def best_vline(ax):
         if best_epoch:
-            ax.axvline(best_epoch, color=C_BEST, linestyle=":", linewidth=1.8,
-                       alpha=0.85, label=f"Best ep. {best_epoch}")
+            ax.axvline(best_epoch, color=C_BEST, linestyle=":", linewidth=1.6,
+                       alpha=0.85, label=f"Best ep.{best_epoch}")
 
-    leg_kw = dict(fontsize=8, facecolor=BG_CARD, labelcolor=C_TEXT,
+    leg_kw = dict(fontsize=7.5, facecolor=BG_CARD, labelcolor=C_TEXT,
                   edgecolor=C_GRID, framealpha=0.9)
 
-    # ── [0,0] Train Loss ─────────────────────────────────────────────
-    ax1 = fig.add_subplot(gs[0, 0])
-    style(ax1, "Train Loss")
-    ax1.plot(epochs, train_losses, color=C_TRAIN, linewidth=2,
-             marker="o", markersize=3.5, label="Train loss")
-    best_vline(ax1)
-    ax1.legend(**leg_kw)
-
-    # ── [0,1] Train vs Val ───────────────────────────────────────────
-    ax2 = fig.add_subplot(gs[0, 1])
-    style(ax2, "Train vs Validation Loss")
-    ax2.plot(epochs, train_losses, color=C_TRAIN, linewidth=2,
-             marker="o", markersize=3.5, label="Train")
+    # ── [0,0] Train vs Val Loss ──────────────────────────────────────
+    ax = fig.add_subplot(gs[0, 0])
+    style(ax, "Train vs Validation Loss", ylabel="Loss")
+    ax.plot(epochs, train_losses, color=C_TRAIN, linewidth=2,
+            marker="o", markersize=3, label="Train")
     if has_val:
-        ax2.plot(val_epochs, val_losses, color=C_VAL, linewidth=2,
-                 marker="s", markersize=3.5, linestyle="--", label="Validation")
-    best_vline(ax2)
-    ax2.legend(**leg_kw)
+        ax.plot(val_epochs, val_losses, color=C_VAL, linewidth=2,
+                marker="s", markersize=3, linestyle="--", label="Val")
+    best_vline(ax)
+    ax.legend(**leg_kw)
 
-    # ── [0,2] Лог-масштаб ────────────────────────────────────────────
-    ax3 = fig.add_subplot(gs[0, 2])
-    style(ax3, "Loss (логарифмический масштаб)", ylabel="log(Loss)")
-    log_train = np.log(np.clip(train_losses, 1e-9, None))
-    ax3.plot(epochs, log_train, color=C_TRAIN, linewidth=2,
-             marker="o", markersize=3.5, label="log(Train)")
+    # ── [0,1] Log-Loss ───────────────────────────────────────────────
+    ax = fig.add_subplot(gs[0, 1])
+    style(ax, "Loss (лог-масштаб)", ylabel="log(Loss)")
+    ax.plot(epochs, np.log(np.clip(train_losses, 1e-9, None)),
+            color=C_TRAIN, linewidth=2, marker="o", markersize=3, label="log Train")
     if has_val:
-        log_val = np.log(np.clip(val_losses, 1e-9, None))
-        ax3.plot(val_epochs, log_val, color=C_VAL, linewidth=2,
-                 marker="s", markersize=3.5, linestyle="--", label="log(Val)")
-    best_vline(ax3)
-    ax3.legend(**leg_kw)
+        ax.plot(val_epochs, np.log(np.clip(val_losses, 1e-9, None)),
+                color=C_VAL, linewidth=2, marker="s", markersize=3,
+                linestyle="--", label="log Val")
+    best_vline(ax)
+    ax.legend(**leg_kw)
 
-    # ── [1,0] Δ Loss ─────────────────────────────────────────────────
-    ax4 = fig.add_subplot(gs[1, 0])
-    style(ax4, "Изменение Train Loss (Δ)", ylabel="ΔLoss")
-    d = [train_losses[i] - train_losses[i - 1] for i in range(1, len(train_losses))]
-    d_ep = epochs[1:]
-    bar_colors = [C_POS if v > 0 else C_NEG for v in d]
-    ax4.bar(d_ep, d, color=bar_colors, alpha=0.85, width=0.65)
-    ax4.axhline(0, color=C_TEXT, linewidth=0.8)
-    ax4.set_xlabel("Эпоха", color=C_MUTED, fontsize=8.5)
-    pos_p = mpatches.Patch(color=C_POS, label="Рост loss")
-    neg_p = mpatches.Patch(color=C_NEG, label="Снижение loss")
-    ax4.legend(handles=[pos_p, neg_p], **leg_kw)
+    # ── [0,2] Δ Loss ─────────────────────────────────────────────────
+    ax = fig.add_subplot(gs[0, 2])
+    style(ax, "Изменение Train Loss (Δ)", ylabel="ΔLoss")
+    if len(train_losses) > 1:
+        d      = [train_losses[i] - train_losses[i - 1] for i in range(1, len(train_losses))]
+        d_ep   = epochs[1:]
+        bcolors = [C_POS if v > 0 else C_NEG for v in d]
+        ax.bar(d_ep, d, color=bcolors, alpha=0.85, width=0.65)
+        ax.axhline(0, color=C_TEXT, linewidth=0.8)
+        pos_p = mpatches.Patch(color=C_POS, label="Рост")
+        neg_p = mpatches.Patch(color=C_NEG, label="Снижение")
+        ax.legend(handles=[pos_p, neg_p], **leg_kw)
 
-    # ── [1,1] Скользящее среднее ─────────────────────────────────────
-    ax5 = fig.add_subplot(gs[1, 1])
-    style(ax5, "Скользящее среднее (окно=3)")
-    ax5.plot(epochs, train_losses, color=C_TRAIN, linewidth=1,
-             alpha=0.35, label="Train (raw)")
-    ma = moving_avg(train_losses)
+    # ── [1,0] Accuracy ───────────────────────────────────────────────
+    ax = fig.add_subplot(gs[1, 0])
+    style(ax, "Token Accuracy", ylabel="Accuracy")
+    if train_accs:
+        ax.plot(_ep(train_accs), train_accs, color=C_TRAIN, linewidth=2,
+                marker="o", markersize=3, label="Train")
+    if val_accs and any(v > 0 for v in val_accs):
+        ax.plot(_ep(val_accs), val_accs, color=C_VAL, linewidth=2,
+                marker="s", markersize=3, linestyle="--", label="Val")
+    best_vline(ax)
+    ax.set_ylim(0, 1)
+    ax.legend(**leg_kw)
+
+    # ── [1,1] F1 Score ───────────────────────────────────────────────
+    ax = fig.add_subplot(gs[1, 1])
+    style(ax, "F1 Score (macro)", ylabel="F1")
+    if train_f1s:
+        ax.plot(_ep(train_f1s), train_f1s, color=C_TRAIN, linewidth=2,
+                marker="o", markersize=3, label="Train")
+    if val_f1s and any(v > 0 for v in val_f1s):
+        ax.plot(_ep(val_f1s), val_f1s, color=C_VAL, linewidth=2,
+                marker="s", markersize=3, linestyle="--", label="Val")
+    best_vline(ax)
+    ax.set_ylim(0, 1)
+    ax.legend(**leg_kw)
+
+    # ── [1,2] Perplexity ─────────────────────────────────────────────
+    ax = fig.add_subplot(gs[1, 2])
+    style(ax, "Perplexity", ylabel="PPL")
+    if train_perplexities:
+        ax.plot(_ep(train_perplexities), train_perplexities, color=C_TRAIN, linewidth=2,
+                marker="o", markersize=3, label="Train")
+    if val_perplexities and any(v > 1 for v in val_perplexities):
+        ax.plot(_ep(val_perplexities), val_perplexities, color=C_VAL, linewidth=2,
+                marker="s", markersize=3, linestyle="--", label="Val")
+    best_vline(ax)
+    ax.legend(**leg_kw)
+
+    # ── [2,0] Top-5 Accuracy ─────────────────────────────────────────
+    ax = fig.add_subplot(gs[2, 0])
+    style(ax, "Top-5 Token Accuracy", ylabel="Top-5 Acc")
+    if train_top5_accs:
+        ax.plot(_ep(train_top5_accs), train_top5_accs, color=C_TRAIN, linewidth=2,
+                marker="o", markersize=3, label="Train")
+    if val_top5_accs and any(v > 0 for v in val_top5_accs):
+        ax.plot(_ep(val_top5_accs), val_top5_accs, color=C_VAL, linewidth=2,
+                marker="s", markersize=3, linestyle="--", label="Val")
+    best_vline(ax)
+    ax.set_ylim(0, 1)
+    ax.legend(**leg_kw)
+
+    # ── [2,1] Скользящее среднее loss ────────────────────────────────
+    ax = fig.add_subplot(gs[2, 1])
+    style(ax, "Loss — скользящее среднее (окно=3)", ylabel="Loss")
+    ax.plot(epochs, train_losses, color=C_TRAIN, linewidth=1, alpha=0.3, label="Train (raw)")
+    ma    = moving_avg(train_losses)
     ma_ep = list(range(2, len(ma) + 2))
-    ax5.plot(ma_ep, ma, color=C_MA, linewidth=2.5, label="MA Train")
+    ax.plot(ma_ep, ma, color=C_MA, linewidth=2.5, label="MA Train")
     if has_val and len(val_losses) >= 3:
-        val_ma = moving_avg(val_losses)
+        val_ma    = moving_avg(val_losses)
         val_ma_ep = list(range(2, len(val_ma) + 2))
-        ax5.plot(val_ma_ep, val_ma, color=C_VAL, linewidth=2,
-                 linestyle="--", label="MA Val")
-    best_vline(ax5)
-    ax5.legend(**leg_kw)
+        ax.plot(val_ma_ep, val_ma, color=C_VAL, linewidth=2, linestyle="--", label="MA Val")
+    best_vline(ax)
+    ax.legend(**leg_kw)
 
-    # ── [1,2] Карточка «Лучшая эпоха» ────────────────────────────────
-    ax6 = fig.add_subplot(gs[1, 2])
+    # ── [2,2] Карточка «Лучшая эпоха» ────────────────────────────────
+    ax6 = fig.add_subplot(gs[2, 2])
     ax6.set_facecolor(BG_CARD)
     ax6.axis("off")
     for sp in ax6.spines.values():
         sp.set_edgecolor(C_GRID)
 
-    # Заголовок карточки
-    ax6.text(0.5, 0.96, "🏆  Лучшая эпоха", transform=ax6.transAxes,
-             ha="center", va="top", fontsize=12, fontweight="bold", color=C_BEST)
-
-    # Большой номер эпохи
-    ax6.text(0.5, 0.76, str(best_epoch), transform=ax6.transAxes,
-             ha="center", va="top", fontsize=38, fontweight="bold", color=C_BEST)
-
-    # Разделитель (axhline не принимает transform, рисуем через plot в осях)
-    ax6.plot([0.05, 0.95], [0.63, 0.63], color=C_GRID, linewidth=1,
+    ax6.text(0.5, 0.97, "Лучшая эпоха", transform=ax6.transAxes,
+             ha="center", va="top", fontsize=11, fontweight="bold", color=C_BEST)
+    ax6.text(0.5, 0.80, str(best_epoch), transform=ax6.transAxes,
+             ha="center", va="top", fontsize=36, fontweight="bold", color=C_BEST)
+    ax6.plot([0.05, 0.95], [0.66, 0.66], color=C_GRID, linewidth=1,
              transform=ax6.transAxes, clip_on=False)
 
-    # Метрики
-    metrics = [
-        ("Best loss",       f"{best_loss:.4f}"),
-        ("Min train loss",  f"{min(train_losses):.4f}"),
-        ("Final train",     f"{train_losses[-1]:.4f}"),
-    ]
-    if has_val:
-        metrics += [
-            ("Min val loss",    f"{min(val_losses):.4f}"),
-            ("Final val",       f"{val_losses[-1]:.4f}"),
-        ]
+    # Сводная таблица метрик
+    card_rows = [("Best loss", f"{best_loss:.4f}")]
+    if train_accs:
+        card_rows.append(("Final train acc", f"{train_accs[-1]:.4f}"))
+    if val_accs and any(v > 0 for v in val_accs):
+        card_rows.append(("Final val acc",   f"{val_accs[-1]:.4f}"))
+    if train_f1s:
+        card_rows.append(("Final train F1",  f"{train_f1s[-1]:.4f}"))
+    if val_f1s and any(v > 0 for v in val_f1s):
+        card_rows.append(("Final val F1",    f"{val_f1s[-1]:.4f}"))
+    if train_perplexities:
+        card_rows.append(("Final PPL",       f"{train_perplexities[-1]:.2f}"))
     if len(train_losses) > 1:
         pct = (train_losses[0] - train_losses[-1]) / (abs(train_losses[0]) + 1e-9) * 100
-        metrics.append(("Улучшение",  f"{pct:+.1f}%"))
-    metrics.append(("Эпох обучено", str(len(train_losses))))
+        card_rows.append(("Loss улучшение",  f"{pct:+.1f}%"))
+    card_rows.append(("Эпох обучено", str(len(train_losses))))
 
-    y_start = 0.60
-    row_h   = 0.085
-    for i, (label, value) in enumerate(metrics):
-        y = y_start - i * row_h
-        bg_color = "#111128" if i % 2 == 0 else BG_CARD
-        ax6.add_patch(plt.Rectangle((0.02, y - 0.04), 0.96, row_h,
+    y_start = 0.63
+    row_h   = min(0.08, 0.60 / max(len(card_rows), 1))
+    for i, (label, value) in enumerate(card_rows):
+        y  = y_start - i * row_h
+        bg = "#111128" if i % 2 == 0 else BG_CARD
+        ax6.add_patch(plt.Rectangle((0.02, y - row_h * 0.45), 0.96, row_h,
                                     transform=ax6.transAxes,
-                                    facecolor=bg_color, edgecolor="none", zorder=0))
-        ax6.text(0.08, y, label, transform=ax6.transAxes,
-                 ha="left", va="center", fontsize=9, color=C_MUTED)
-        ax6.text(0.92, y, value, transform=ax6.transAxes,
-                 ha="right", va="center", fontsize=9.5, fontweight="bold",
-                 color=C_BEST if "loss" in label.lower() or "%" in value else C_TEXT)
+                                    facecolor=bg, edgecolor="none", zorder=0))
+        ax6.text(0.07, y, label, transform=ax6.transAxes,
+                 ha="left", va="center", fontsize=8.5, color=C_MUTED)
+        ax6.text(0.93, y, value, transform=ax6.transAxes,
+                 ha="right", va="center", fontsize=8.5, fontweight="bold",
+                 color=C_BEST if ("loss" in label.lower() or "%" in value) else C_TEXT)
 
     # ── Общий заголовок ───────────────────────────────────────────────
     fig.suptitle("Audio → Music  ·  Визуализация обучения",
@@ -325,7 +372,7 @@ def train_on_data_dir(
     recursive: bool = False,
     batch_size: int = 4,
     epochs: int = None,       # None = автоподбор по размеру датасета
-    max_samples: int = 5000,  # поднято с 200 — берём весь датасет
+    max_samples: int = 20000,
 ):
     """
     Обучает модель на папке с wav+midi парами.
@@ -447,6 +494,14 @@ def train_on_data_dir(
         save_dir=save_dir,
         best_epoch=best_epoch,
         best_loss=best_loss,
+        train_accs=getattr(trainer, 'train_accs', None),
+        val_accs=getattr(trainer, 'val_accs', None),
+        train_f1s=getattr(trainer, 'train_f1s', None),
+        val_f1s=getattr(trainer, 'val_f1s', None),
+        train_perplexities=getattr(trainer, 'train_perplexities', None),
+        val_perplexities=getattr(trainer, 'val_perplexities', None),
+        train_top5_accs=getattr(trainer, 'train_top5_accs', None),
+        val_top5_accs=getattr(trainer, 'val_top5_accs', None),
     )
 
     return best_model_path, midi_only
@@ -546,7 +601,7 @@ def run_pipeline(
     scale_factor: float = 0.8,
     batch_size: int = 4,
     epochs: int = None,
-    max_samples: int = 5000,
+    max_samples: int = 20000,
 ) -> dict:
     """
     Универсальный пайплайн. Три сценария:
@@ -714,7 +769,7 @@ if __name__ == "__main__":
     parser.add_argument("--scale",          type=float, default=0.8, help="Масштаб страницы PDF (0.5–1.5)")
     parser.add_argument("--batch-size",     type=int,   default=4,   help="Размер батча при обучении")
     parser.add_argument("--epochs",         type=int,   default=None, help="Эпох обучения (по умолчанию автоподбор)")
-    parser.add_argument("--max-samples",    type=int,   default=5000,  help="Максимум пар для обучения (0 = все)")
+    parser.add_argument("--max-samples",    type=int,   default=20000, help="Максимум пар для обучения (0 = все)")
 
     args = parser.parse_args()
 

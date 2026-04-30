@@ -8,14 +8,20 @@ import librosa
 import pretty_midi
 import json
 import os
+import math
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import warnings
 import time
 import glob
 
-#test
 warnings.filterwarnings('ignore')
+
+try:
+    from sklearn.metrics import f1_score as sk_f1_score
+    _SKLEARN_AVAILABLE = True
+except ImportError:
+    _SKLEARN_AVAILABLE = False
 
 # Проверяем доступность GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -83,7 +89,7 @@ class AudioFeatureExtractor(nn.Module):
     Multi-branch Conv → Fusion → ResBlocks (GroupNorm + SE) → Attention Pool → Transformer Encoder.
     """
 
-    def __init__(self, input_channels=1, hidden_dim=512, num_layers=4, dropout=0.1):
+    def __init__(self, input_channels=1, hidden_dim=512, num_layers=4, dropout=0.2):
         super().__init__()
 
         # Мультиветочная свёртка: 3 ветки с разными размерами ядер
@@ -180,6 +186,7 @@ class MusicTokenizer:
         self.pitch_tokens = {}
         self.duration_tokens = {}
         self.velocity_tokens = {}
+        self.token_freqs: Dict[int, int] = {}  # idx → частота, для взвешенного loss
 
     def build_from_midi_files(self, midi_files: List[str], max_vocab_size=5000, min_freq: int = 1):
         """
@@ -217,6 +224,13 @@ class MusicTokenizer:
 
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
         self.vocab_size = len(self.vocab)
+
+        # Сохраняем частоты по индексам (специальные токены считаем как среднее)
+        avg_freq = int(np.mean(list(token_counter.values()))) if token_counter else 1
+        self.token_freqs = {
+            self.vocab[t]: token_counter.get(t, avg_freq)
+            for t in self.vocab
+        }
 
         # Подробная статистика
         pitch_cnt    = sum(1 for t in self.vocab if t.startswith("PITCH_"))
@@ -294,6 +308,29 @@ class MusicTokenizer:
         encoded = self.encode(['<SOS>'] + tokens + ['<EOS>'])
         return encoded
 
+    def tokenize_midi_segment(self, midi_path: str,
+                               start_sec: float, end_sec: float) -> List[int]:
+        """
+        Токенизирует только ноты из диапазона [start_sec, end_sec).
+        Ноты сортируются по времени начала.
+        """
+        tokens = []
+        try:
+            midi = pretty_midi.PrettyMIDI(midi_path)
+            all_notes = []
+            for instrument in midi.instruments:
+                for note in instrument.notes:
+                    if start_sec <= note.start < end_sec:
+                        all_notes.append(note)
+            all_notes.sort(key=lambda n: n.start)
+            for note in all_notes:
+                tokens.append(f"PITCH_{note.pitch}")
+                tokens.append(f"VEL_{min(note.velocity // 10, 9)}")
+                tokens.append(f"DUR_{self._quantize_duration(note.end - note.start)}")
+        except Exception:
+            pass
+        return self.encode(['<SOS>'] + tokens + ['<EOS>'])
+
 
 # Alias for backward compatibility with older checkpoints
 EnhancedMusicTokenizer = MusicTokenizer
@@ -331,7 +368,7 @@ class MusicTransformerDecoder(nn.Module):
     Принимает memory из энкодера и авторегрессивно генерирует токены.
     """
 
-    def __init__(self, vocab_size, hidden_dim=512, num_layers=6, dropout=0.1, max_len=1000):
+    def __init__(self, vocab_size, hidden_dim=512, num_layers=6, dropout=0.2, max_len=1000):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -500,163 +537,149 @@ class AudioMusicDataset(Dataset):
 
         print(f"Found {len(self.pairs)} audio-midi pairs")
 
+    def _get_total_duration(self, path) -> float:
+        """Возвращает длительность файла в секундах (быстро, без полной загрузки аудио)."""
+        path_str = str(path).lower()
+        try:
+            if path_str.endswith(('.mid', '.midi')):
+                return pretty_midi.PrettyMIDI(str(path)).get_end_time()
+            else:
+                return librosa.get_duration(path=str(path))
+        except Exception:
+            return float(self.max_audio_len)
+
     def _collect_pairs(self):
-        """Собирает пары аудио-MIDI файлов"""
+        """
+        Собирает сегменты (audio_path, midi_path, start_sec).
+
+        Каждый трек нарезается на окна длиной max_audio_len секунд.
+        Например, трек 45 секунд → 4 сегмента: 0-10, 10-20, 20-30, 30-40
+        (последние секунды отбрасываются только если они короче окна).
+        """
+        chunk_sec = self.max_audio_len
         pairs = []
 
-        # Ищем MIDI файлы
         midi_extensions = ['.mid', '.midi']
         midi_files = []
-
-        # Проверяем все возможные пути
         search_paths = [
             self.data_dir,
             self.data_dir / 'midi',
             self.data_dir / 'MIDI',
             self.data_dir / 'midi_files',
-            self.data_dir / 'MIDI_Files'
+            self.data_dir / 'MIDI_Files',
         ]
-
         for search_path in search_paths:
             if search_path.exists():
                 for ext in midi_extensions:
                     midi_files.extend(search_path.glob(f'**/*{ext}'))
                     midi_files.extend(search_path.glob(f'*{ext}'))
-
-        # Убираем дубликаты
         midi_files = list(set(midi_files))
-
         print(f"Found {len(midi_files)} MIDI files in dataset")
 
         for midi_file in midi_files:
             if self.generate_audio_from_midi:
-                # Генерируем аудио из MIDI на лету
-                pairs.append((midi_file, midi_file))
+                total_dur = self._get_total_duration(midi_file)
+                n_chunks  = max(1, int(total_dur / chunk_sec))
+                for i in range(n_chunks):
+                    start = i * chunk_sec
+                    if start < total_dur:
+                        pairs.append((midi_file, midi_file, start))
             else:
-                # Ищем существующее аудио
-                audio_found = False
                 audio_extensions = ['.wav', '.mp3', '.flac', '.ogg']
-
-                # Проверяем разные возможные расположения аудио файлов
-                possible_audio_locations = [
-                    midi_file.with_suffix(audio_ext) for audio_ext in audio_extensions
-                ]
-
-                # Также проверяем в папке audio/ если есть
+                possible = [midi_file.with_suffix(ext) for ext in audio_extensions]
                 audio_dir = self.data_dir / 'audio'
                 if audio_dir.exists():
-                    for audio_ext in audio_extensions:
-                        audio_name = midi_file.stem + audio_ext
-                        possible_audio_locations.append(audio_dir / audio_name)
-
-                for audio_file in possible_audio_locations:
-                    if audio_file.exists():
-                        pairs.append((audio_file, midi_file))
-                        audio_found = True
-                        break
+                    for ext in audio_extensions:
+                        possible.append(audio_dir / (midi_file.stem + ext))
+                audio_file = next((p for p in possible if p.exists()), None)
+                if audio_file:
+                    total_dur = self._get_total_duration(audio_file)
+                    n_chunks  = max(1, int(total_dur / chunk_sec))
+                    for i in range(n_chunks):
+                        start = i * chunk_sec
+                        if start < total_dur:
+                            pairs.append((audio_file, midi_file, start))
 
         if not pairs:
             print("No audio-MIDI pairs found!")
-
         return pairs
 
-    def _midi_to_audio(self, midi_path, max_duration=10):
-        """Конвертирует MIDI в аудио с помощью pretty_midi"""
+    def _midi_to_audio_segment(self, midi_path, start_sec: float) -> np.ndarray:
+        """Генерирует аудио-сегмент из MIDI, начиная с start_sec."""
+        duration   = self.max_audio_len
+        target_len = int(duration * self.sample_rate)
         try:
-            # Загружаем MIDI
-            midi = pretty_midi.PrettyMIDI(str(midi_path))
-
-            # Ограничиваем длительность
-            total_duration = min(midi.get_end_time(), max_duration)
-
-            # Генерируем аудио
+            midi  = pretty_midi.PrettyMIDI(str(midi_path))
             audio = midi.fluidsynth(fs=self.sample_rate)
-
-            # Обрезаем до max_duration
-            max_samples = int(max_duration * self.sample_rate)
-            if len(audio) > max_samples:
-                audio = audio[:max_samples]
-
-            return audio
-
+            s     = int(start_sec * self.sample_rate)
+            segment = audio[s: s + target_len]
+            if len(segment) < target_len:
+                segment = np.pad(segment, (0, target_len - len(segment)))
+            return segment
         except Exception as e:
-            print(f"Error converting MIDI to audio {midi_path}: {e}")
-            # Возвращаем тишину
-            return np.zeros(int(max_duration * self.sample_rate))
+            print(f"Error converting MIDI segment {midi_path} @{start_sec}s: {e}")
+            return np.zeros(target_len)
 
     def __getitem__(self, idx):
-        # Используем кэш если есть
         if self.use_cache and idx in self.cache:
             return self.cache[idx]
 
-        audio_path_or_midi, midi_path = self.pairs[idx]
+        audio_path_or_midi, midi_path, start_sec = self.pairs[idx]
 
         try:
-            # Загружаем и обрабатываем аудио
+            # Загружаем аудио-сегмент [start_sec, start_sec + max_audio_len)
             if self.generate_audio_from_midi and str(audio_path_or_midi).lower().endswith(('.mid', '.midi')):
-                # Генерируем аудио из MIDI
-                audio = self._midi_to_audio(audio_path_or_midi, self.max_audio_len)
-                sr = self.sample_rate
+                audio = self._midi_to_audio_segment(audio_path_or_midi, start_sec)
+                sr    = self.sample_rate
             else:
-                # Загружаем существующее аудио
-                audio, sr = librosa.load(str(audio_path_or_midi), sr=self.sample_rate,
-                                         duration=self.max_audio_len)
+                audio, sr = librosa.load(
+                    str(audio_path_or_midi),
+                    sr=self.sample_rate,
+                    offset=start_sec,
+                    duration=self.max_audio_len,
+                )
 
-            # Вычисляем спектрограмму
+            # Спектрограмма
             spectrogram = librosa.feature.melspectrogram(
-                y=audio,
-                sr=sr,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                n_mels=128
+                y=audio, sr=sr,
+                n_fft=self.n_fft, hop_length=self.hop_length, n_mels=128,
             )
-
-            # Логарифмическая шкала и нормализация
             spectrogram = librosa.power_to_db(spectrogram, ref=np.max)
             spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-8)
 
-            # Преобразуем в тензор и паддим до фиксированной ширины
-            # (разные WAV имеют разную длину → разные time_steps → батч не собирается)
-            FIXED_TIME = 431  # ~10 сек при sr=22050, hop=512
-            spectrogram = torch.FloatTensor(spectrogram)  # [n_mels, time]
-            time_steps = spectrogram.shape[1]
-            if time_steps >= FIXED_TIME:
+            # Фиксируем ширину тензора (~10 сек при sr=22050, hop=512)
+            FIXED_TIME = 431
+            spectrogram = torch.FloatTensor(spectrogram)
+            if spectrogram.shape[1] >= FIXED_TIME:
                 spectrogram = spectrogram[:, :FIXED_TIME]
             else:
-                pad = torch.zeros(spectrogram.shape[0], FIXED_TIME - time_steps)
+                pad = torch.zeros(spectrogram.shape[0], FIXED_TIME - spectrogram.shape[1])
                 spectrogram = torch.cat([spectrogram, pad], dim=1)
             spectrogram = spectrogram.unsqueeze(0)  # [1, n_mels, FIXED_TIME]
 
-            # Токенизируем MIDI
+            # Токенизируем только ноты из того же временного окна
             try:
-                token_ids = self.tokenizer.tokenize_midi(str(midi_path))
-            except:
+                end_sec   = start_sec + self.max_audio_len
+                token_ids = self.tokenizer.tokenize_midi_segment(str(midi_path), start_sec, end_sec)
+            except Exception:
                 token_ids = [1, 2]  # SOS, EOS
 
             token_tensor = torch.LongTensor(token_ids)
-
-            # Обрезаем или дополняем последовательность
             max_token_len = 500
             if len(token_tensor) > max_token_len:
                 token_tensor = token_tensor[:max_token_len]
             else:
-                padding = torch.zeros(max_token_len - len(token_tensor), dtype=torch.long)
-                token_tensor = torch.cat([token_tensor, padding])
+                pad = torch.zeros(max_token_len - len(token_tensor), dtype=torch.long)
+                token_tensor = torch.cat([token_tensor, pad])
 
             result = (spectrogram, token_tensor)
-
-            # Сохраняем в кэш
             if self.use_cache:
                 self.cache[idx] = result
-
             return result
 
         except Exception as e:
             print(f"Error processing item {idx}: {e}")
-            # Возвращаем нулевые тензоры фиксированного размера
-            spectrogram = torch.zeros(1, 128, 431)  # [1, n_mels, FIXED_TIME]
-            token_tensor = torch.zeros(500, dtype=torch.long)
-            return (spectrogram, token_tensor)
+            return (torch.zeros(1, 128, 431), torch.zeros(500, dtype=torch.long))
 
     def __len__(self):
         return len(self.pairs)
@@ -686,14 +709,26 @@ class Audio2MusicTrainer:
         self.tokenizer = tokenizer
         self.accum_steps = max(1, accum_steps)
 
-        # Label Smoothing: 0.1 — стандартная практика
+        # Взвешенный CrossEntropy: редкие токены получают больший вес
+        # weight[i] = median_freq / freq[i]  — сглаженная балансировка
+        class_weights = None
+        if hasattr(tokenizer, 'token_freqs') and tokenizer.token_freqs:
+            freqs   = np.array([tokenizer.token_freqs.get(i, 1)
+                                 for i in range(tokenizer.vocab_size)], dtype=np.float32)
+            median  = float(np.median(freqs))
+            weights = np.clip(median / freqs, 0.1, 10.0)  # не даём экстремальных весов
+            weights[0] = 0.0   # PAD → всё равно игнорируем через ignore_index
+            class_weights = torch.FloatTensor(weights).to(self.device)
+
         self.criterion = nn.CrossEntropyLoss(
-            ignore_index=0, label_smoothing=label_smoothing
+            ignore_index=0,
+            label_smoothing=label_smoothing,
+            weight=class_weights,
         ).to(self.device)
 
         self.optimizer = optim.AdamW(
-            model.parameters(), lr=1e-4, weight_decay=1e-5,
-            betas=(0.9, 0.98),    # β₂=0.98 из оригинального Transformer
+            model.parameters(), lr=1e-4, weight_decay=1e-4,
+            betas=(0.9, 0.98),
         )
 
         self.warmup_epochs = warmup_epochs
@@ -703,10 +738,45 @@ class Audio2MusicTrainer:
         self._scheduler_warmup = None   # будет создан в train()
         self._scheduler_cosine = None
 
-        self.train_losses: list = []
-        self.val_losses:   list = []
+        self.train_losses:       list = []
+        self.val_losses:         list = []
+        self.train_accs:         list = []
+        self.val_accs:           list = []
+        self.train_f1s:          list = []
+        self.val_f1s:            list = []
+        self.train_perplexities: list = []
+        self.val_perplexities:   list = []
+        self.train_top5_accs:    list = []
+        self.val_top5_accs:      list = []
         self.best_val_loss  = float('inf')
         self.best_epoch: int = 0
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_batch_metrics(output_flat, target_flat):
+        """
+        Вычисляет метрики для одного батча (без влияния на граф вычислений).
+
+        output_flat : [N, vocab_size] — логиты
+        target_flat : [N]             — целевые индексы
+        Возвращает (acc, top5_acc, preds_cpu, targets_cpu) — только не-PAD позиции.
+        """
+        mask = target_flat != 0
+        if mask.sum() == 0:
+            empty = torch.tensor([], dtype=torch.long)
+            return 0.0, 0.0, empty, empty
+
+        masked_out = output_flat[mask]
+        masked_tgt = target_flat[mask]
+
+        preds = masked_out.argmax(dim=-1)
+        acc   = (preds == masked_tgt).float().mean().item()
+
+        k     = min(5, masked_out.size(-1))
+        top5  = masked_out.topk(k, dim=-1).indices          # [M, k]
+        top5_acc = (top5 == masked_tgt.unsqueeze(1)).any(dim=-1).float().mean().item()
+
+        return acc, top5_acc, preds.cpu(), masked_tgt.cpu()
 
     # ------------------------------------------------------------------
     def _save_checkpoint(self, path, epoch, train_loss, val_loss, is_best):
@@ -719,6 +789,14 @@ class Audio2MusicTrainer:
             'val_loss':            val_loss,
             'train_losses':        self.train_losses,
             'val_losses':          self.val_losses,
+            'train_accs':          self.train_accs,
+            'val_accs':            self.val_accs,
+            'train_f1s':           self.train_f1s,
+            'val_f1s':             self.val_f1s,
+            'train_perplexities':  self.train_perplexities,
+            'val_perplexities':    self.val_perplexities,
+            'train_top5_accs':     self.train_top5_accs,
+            'val_top5_accs':       self.val_top5_accs,
             'tokenizer':           self.tokenizer,
             'vocab_size':          self.tokenizer.vocab_size,
             'is_best':             is_best,
@@ -731,8 +809,12 @@ class Audio2MusicTrainer:
     # ------------------------------------------------------------------
     def train_epoch(self, train_loader):
         self.model.train()
-        total_loss       = 0.0
+        total_loss        = 0.0
+        total_acc         = 0.0
+        total_top5        = 0.0
         processed_batches = 0
+        all_preds_ep:   list = []
+        all_targets_ep: list = []
         self.optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, (audio_features, target_tokens) in enumerate(train_loader):
@@ -772,24 +854,63 @@ class Audio2MusicTrainer:
             total_loss       += loss.item() * self.accum_steps
             processed_batches += 1
 
+            # Метрики (без влияния на граф вычислений)
+            with torch.no_grad():
+                b_acc, b_top5, b_preds, b_tgts = self._compute_batch_metrics(
+                    output.detach().reshape(-1, output.size(-1)),
+                    decoder_target.reshape(-1),
+                )
+                total_acc  += b_acc
+                total_top5 += b_top5
+                if len(b_preds) > 0:
+                    all_preds_ep.append(b_preds)
+                    all_targets_ep.append(b_tgts)
+
             if batch_idx % 5 == 0:
-                print(f"  Batch {batch_idx}/{len(train_loader)}: Loss: {loss.item() * self.accum_steps:.4f}")
+                print(f"  Batch {batch_idx}/{len(train_loader)}: "
+                      f"Loss: {loss.item() * self.accum_steps:.4f}  Acc: {b_acc:.3f}")
 
         if processed_batches == 0:
-            return 0.0
+            return {"loss": 0.0, "acc": 0.0, "top5_acc": 0.0, "f1": 0.0, "f1_weighted": 0.0, "perplexity": 1.0}
 
-        avg = total_loss / processed_batches
+        avg      = total_loss / processed_batches
+        avg_acc  = total_acc  / processed_batches
+        avg_top5 = total_top5 / processed_batches
+
+        f1 = f1_weighted = 0.0
+        if _SKLEARN_AVAILABLE and all_preds_ep:
+            try:
+                all_p = torch.cat(all_preds_ep).numpy()
+                all_t = torch.cat(all_targets_ep).numpy()
+                f1          = float(sk_f1_score(all_t, all_p, average='macro',    zero_division=0))
+                f1_weighted = float(sk_f1_score(all_t, all_p, average='weighted', zero_division=0))
+            except Exception:
+                pass
+
+        perplexity = math.exp(min(avg, 100))
+
         self.train_losses.append(avg)
-        return avg
+        self.train_accs.append(avg_acc)
+        self.train_top5_accs.append(avg_top5)
+        self.train_f1s.append(f1_weighted)   # сохраняем weighted как основной
+        self.train_perplexities.append(perplexity)
+
+        return {"loss": avg, "acc": avg_acc, "top5_acc": avg_top5,
+                "f1": f1_weighted, "f1_macro": f1, "perplexity": perplexity}
 
     # ------------------------------------------------------------------
     def validate(self, val_loader):
+        _zero = {"loss": 0.0, "acc": 0.0, "top5_acc": 0.0, "f1": 0.0, "perplexity": 1.0}
         if val_loader is None:
-            return 0.0
+            return _zero
 
         self.model.eval()
-        total_loss       = 0.0
+        total_loss        = 0.0
+        total_acc         = 0.0
+        total_top5        = 0.0
         processed_batches = 0
+        all_preds_ep:   list = []
+        all_targets_ep: list = []
 
         with torch.no_grad():
             for audio_features, target_tokens in val_loader:
@@ -817,12 +938,43 @@ class Audio2MusicTrainer:
                 total_loss       += loss.item()
                 processed_batches += 1
 
-        if processed_batches == 0:
-            return 0.0
+                b_acc, b_top5, b_preds, b_tgts = self._compute_batch_metrics(
+                    output.reshape(-1, output.size(-1)),
+                    decoder_target.reshape(-1),
+                )
+                total_acc  += b_acc
+                total_top5 += b_top5
+                if len(b_preds) > 0:
+                    all_preds_ep.append(b_preds)
+                    all_targets_ep.append(b_tgts)
 
-        avg = total_loss / processed_batches
+        if processed_batches == 0:
+            return _zero
+
+        avg      = total_loss / processed_batches
+        avg_acc  = total_acc  / processed_batches
+        avg_top5 = total_top5 / processed_batches
+
+        f1 = f1_weighted = 0.0
+        if _SKLEARN_AVAILABLE and all_preds_ep:
+            try:
+                all_p = torch.cat(all_preds_ep).numpy()
+                all_t = torch.cat(all_targets_ep).numpy()
+                f1          = float(sk_f1_score(all_t, all_p, average='macro',    zero_division=0))
+                f1_weighted = float(sk_f1_score(all_t, all_p, average='weighted', zero_division=0))
+            except Exception:
+                pass
+
+        perplexity = math.exp(min(avg, 100))
+
         self.val_losses.append(avg)
-        return avg
+        self.val_accs.append(avg_acc)
+        self.val_top5_accs.append(avg_top5)
+        self.val_f1s.append(f1_weighted)
+        self.val_perplexities.append(perplexity)
+
+        return {"loss": avg, "acc": avg_acc, "top5_acc": avg_top5,
+                "f1": f1_weighted, "f1_macro": f1, "perplexity": perplexity}
 
     # ------------------------------------------------------------------
     def train(self, train_loader, val_loader, epochs=20, save_dir='./models'):
@@ -853,11 +1005,12 @@ class Audio2MusicTrainer:
         print(f"Grad accumulation:  {self.accum_steps}  |  Early stop patience: {self.early_stopping_patience}")
         print(f"Models → {save_dir}")
 
-        total_start = time.time()
-        saved_files = []
-        no_improve  = 0    # счётчик для early stopping
-        last_train_loss = 0.0
-        last_val_loss   = 0.0
+        _zero_m = {"loss": 0.0, "acc": 0.0, "top5_acc": 0.0, "f1": 0.0, "perplexity": 1.0}
+        total_start      = time.time()
+        saved_files      = []
+        no_improve       = 0
+        last_train_m     = _zero_m
+        last_val_m       = _zero_m
 
         for epoch in range(epochs):
             epoch_start = time.time()
@@ -868,33 +1021,43 @@ class Audio2MusicTrainer:
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
 
-            last_train_loss = self.train_epoch(train_loader)
+            last_train_m = self.train_epoch(train_loader)
 
-            # Обновляем scheduler после каждого батча (уже внутри train_epoch)
-            # Здесь шагаем по эпохе
             global_step += len(train_loader)
             for _ in range(len(train_loader)):
                 scheduler.step()
 
-            last_val_loss = self.validate(val_loader)
-            epoch_time    = time.time() - epoch_start
-            current_lr    = self.optimizer.param_groups[0]['lr']
+            last_val_m = self.validate(val_loader)
+            epoch_time = time.time() - epoch_start
+            current_lr = self.optimizer.param_groups[0]['lr']
+
+            tl, ta, tt, tf, tfm, tp = (last_train_m['loss'], last_train_m['acc'],
+                                        last_train_m['top5_acc'], last_train_m['f1'],
+                                        last_train_m.get('f1_macro', 0.0), last_train_m['perplexity'])
+            vl, va, vt, vf, vfm, vp = (last_val_m['loss'],  last_val_m['acc'],
+                                        last_val_m['top5_acc'],  last_val_m['f1'],
+                                        last_val_m.get('f1_macro', 0.0), last_val_m['perplexity'])
 
             print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"  Train Loss:    {last_train_loss:.4f}")
-            print(f"  Val Loss:      {last_val_loss:.4f}")
-            print(f"  Epoch Time:    {epoch_time:.1f}s")
-            print(f"  Learning Rate: {current_lr:.2e}")
+            print(f"  {'Metric':<18} {'Train':>10}  {'Val':>10}")
+            print(f"  {'-'*40}")
+            print(f"  {'Loss':<18} {tl:>10.4f}  {vl:>10.4f}")
+            print(f"  {'Accuracy':<18} {ta:>10.4f}  {va:>10.4f}")
+            print(f"  {'Top-5 Acc':<18} {tt:>10.4f}  {vt:>10.4f}")
+            print(f"  {'F1 (weighted)':<18} {tf:>10.4f}  {vf:>10.4f}")
+            print(f"  {'F1 (macro)':<18} {tfm:>10.4f}  {vfm:>10.4f}")
+            print(f"  {'Perplexity':<18} {tp:>10.2f}  {vp:>10.2f}")
+            print(f"  Epoch Time: {epoch_time:.1f}s  |  LR: {current_lr:.2e}")
 
             # Лучшая модель
-            monitor = last_val_loss if val_loader else last_train_loss
+            monitor = vl if val_loader else tl
             is_best  = monitor < self.best_val_loss
 
             if is_best:
                 self.best_val_loss = monitor
                 self.best_epoch    = epoch + 1
                 no_improve         = 0
-                saved = self._save_checkpoint(best_path, epoch, last_train_loss, last_val_loss, is_best=True)
+                saved = self._save_checkpoint(best_path, epoch, tl, vl, is_best=True)
                 saved_files.append(saved)
                 print(f"  ✓ BEST model saved (epoch {self.best_epoch}, loss {monitor:.4f})")
             else:
@@ -903,7 +1066,7 @@ class Audio2MusicTrainer:
             # Чекпоинт каждые 5 эпох
             if (epoch + 1) % 5 == 0:
                 ckpt_path = os.path.join(save_dir, f'audio2music_epoch_{epoch + 1}.pth')
-                saved = self._save_checkpoint(ckpt_path, epoch, last_train_loss, last_val_loss, is_best=False)
+                saved = self._save_checkpoint(ckpt_path, epoch, tl, vl, is_best=False)
                 saved_files.append(saved)
                 print(f"  ✓ Checkpoint saved: {ckpt_path}")
 
@@ -916,7 +1079,8 @@ class Audio2MusicTrainer:
         total_time = time.time() - total_start
 
         # Финальная модель
-        saved = self._save_checkpoint(final_path, epochs - 1, last_train_loss, last_val_loss, is_best=False)
+        saved = self._save_checkpoint(final_path, epochs - 1,
+                                      last_train_m['loss'], last_val_m['loss'], is_best=False)
         saved_files.append(saved)
 
         print(f"\n{'=' * 60}")
@@ -972,7 +1136,7 @@ class Audio2MusicTrainer:
 
 # ==================== Data Preparation ====================
 
-def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_workers=2, max_samples=2000):
+def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_workers=2, max_samples=20000):
     """Подготовка данных для обучения с GPU оптимизацией"""
 
     print(f"\nPreparing data from: {data_dir}")
@@ -1006,12 +1170,28 @@ def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_wor
     tokenizer = MusicTokenizer()
     tokenizer.build_from_midi_files(midi_files)   # все файлы, без ограничения
 
+    # Определяем, есть ли уже готовые WAV-файлы рядом с MIDI.
+    # Если хотя бы у 10% файлов есть пара WAV/MP3/FLAC — используем их,
+    # иначе синтезируем через FluidSynth (медленно, но не требует аудио).
+    audio_exts = ('.wav', '.mp3', '.flac', '.ogg')
+    sample_check = midi_files[:min(50, len(midi_files))]
+    n_with_audio = sum(
+        1 for p in sample_check
+        if any(Path(p).with_suffix(e).exists() for e in audio_exts)
+    )
+    has_paired_audio = n_with_audio >= len(sample_check) * 0.1
+    if has_paired_audio:
+        print(f"Найдено {n_with_audio}/{len(sample_check)} WAV-файлов → "
+              f"используем готовое аудио (быстро)")
+    else:
+        print("WAV-файлы не найдены → синтез через FluidSynth (медленно)")
+
     # Создаём датасет
     print("Creating dataset...")
     dataset = AudioMusicDataset(
         data_dir,
         tokenizer,
-        generate_audio_from_midi=True,
+        generate_audio_from_midi=not has_paired_audio,
         max_samples=max_samples
     )
 
@@ -1246,44 +1426,49 @@ class Audio2MusicInference:
         current_time = 0
         i = 0
 
+        duration_map = {
+            '32nd': 0.125, '16th': 0.25, '8th': 0.5,
+            'quarter': 1.0, 'half': 2.0, 'whole': 4.0, 'double': 8.0,
+        }
+
         while i < len(tokens):
-            if i < len(self.tokenizer.reverse_vocab):
-                token_str = self.tokenizer.reverse_vocab.get(tokens[i], '')
-                if token_str.startswith('PITCH_'):
-                    # Извлекаем информацию о ноте
+            token_str = self.tokenizer.reverse_vocab.get(tokens[i], '')
+            if token_str.startswith('PITCH_'):
+                # Извлекаем информацию о ноте
+                try:
                     pitch = min(max(int(token_str.split('_')[1]), 0), 127)
+                except (IndexError, ValueError):
+                    i += 1
+                    continue
 
-                    if i + 2 < len(tokens):
-                        vel_token = self.tokenizer.reverse_vocab.get(tokens[i + 1], 'VEL_7')
-                        dur_token = self.tokenizer.reverse_vocab.get(tokens[i + 2], 'DUR_quarter')
+                if i + 2 < len(tokens):
+                    vel_token = self.tokenizer.reverse_vocab.get(tokens[i + 1], 'VEL_7')
+                    dur_token = self.tokenizer.reverse_vocab.get(tokens[i + 2], 'DUR_quarter')
 
-                        velocity = min(int(vel_token.split('_')[1]) * 10 + 20, 127)
+                    # Безопасный разбор velocity
+                    try:
+                        vel_parts = vel_token.split('_')
+                        velocity = min(int(vel_parts[1]) * 10 + 20, 127) if len(vel_parts) > 1 else 90
+                    except (IndexError, ValueError):
+                        velocity = 90
 
-                        # Конвертируем длительность в секунды
-                        duration_map = {
-                            '32nd': 0.125,
-                            '16th': 0.25,
-                            '8th': 0.5,
-                            'quarter': 1.0,
-                            'half': 2.0,
-                            'whole': 4.0,
-                            'double': 8.0
-                        }
-                        duration = duration_map.get(dur_token.split('_')[1], 1.0)
+                    # Безопасный разбор длительности
+                    try:
+                        dur_parts = dur_token.split('_')
+                        dur_name  = dur_parts[1] if len(dur_parts) > 1 else 'quarter'
+                    except IndexError:
+                        dur_name = 'quarter'
+                    duration = duration_map.get(dur_name, 1.0)
 
-                        # Создаём ноту
-                        note = pretty_midi.Note(
-                            velocity=velocity,
-                            pitch=pitch,
-                            start=current_time,
-                            end=current_time + duration
-                        )
-                        piano.notes.append(note)
-
-                        current_time += duration
-                        i += 3
-                    else:
-                        i += 1
+                    note = pretty_midi.Note(
+                        velocity=velocity,
+                        pitch=pitch,
+                        start=current_time,
+                        end=current_time + duration,
+                    )
+                    piano.notes.append(note)
+                    current_time += duration
+                    i += 3
                 else:
                     i += 1
             else:
