@@ -9,6 +9,7 @@ import pretty_midi
 import json
 import os
 import math
+import random
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import warnings
@@ -247,27 +248,46 @@ class MusicTokenizer:
         try:
             midi = pretty_midi.PrettyMIDI(midi_path)
 
-            # Извлекаем ноты
+            # Собираем все ноты из всех инструментов и сортируем по времени
+            all_notes = []
             for instrument in midi.instruments:
-                for note in instrument.notes:
-                    # Токен для начала ноты
-                    pitch_token = f"PITCH_{note.pitch}"
-                    velocity_token = f"VEL_{min(note.velocity // 10, 9)}"
+                all_notes.extend(instrument.notes)
+            all_notes.sort(key=lambda n: (n.start, n.pitch))
 
-                    # Токен для длительности (квантованная)
-                    duration = note.end - note.start
-                    quantized_duration = self._quantize_duration(duration)
-                    duration_token = f"DUR_{quantized_duration}"
+            prev_start = 0.0
+            for note in all_notes:
+                time_shift = note.start - prev_start
+                tokens.append(f"TIME_{self._quantize_time_shift(time_shift)}")
+                tokens.append(f"PITCH_{note.pitch}")
+                tokens.append(f"VEL_{min(note.velocity // 10, 9)}")
+                tokens.append(f"DUR_{self._quantize_duration(note.end - note.start)}")
+                prev_start = note.start
 
-                    tokens.extend([pitch_token, velocity_token, duration_token])
-
-                # Добавляем токены для пауз
-                # (упрощённо - между концом одной ноты и началом следующей)
-
-        except:
+        except Exception:
             pass
 
         return tokens
+
+    def _quantize_time_shift(self, time_shift: float) -> str:
+        """Квантует временной сдвиг между началами соседних нот."""
+        if time_shift < 0.05:
+            return 'zero'   # одновременные ноты (аккорд)
+        bins = {
+            0.125: '32nd',
+            0.25:  '16th',
+            0.5:   '8th',
+            1.0:   'quarter',
+            2.0:   'half',
+            4.0:   'whole',
+            8.0:   'double',
+        }
+        best, min_diff = 'quarter', float('inf')
+        for val, name in bins.items():
+            diff = abs(time_shift - val)
+            if diff < min_diff:
+                min_diff = diff
+                best = name
+        return best
 
     def _quantize_duration(self, duration: float) -> str:
         """Квантует длительность"""
@@ -311,8 +331,8 @@ class MusicTokenizer:
     def tokenize_midi_segment(self, midi_path: str,
                                start_sec: float, end_sec: float) -> List[int]:
         """
-        Токенизирует только ноты из диапазона [start_sec, end_sec).
-        Ноты сортируются по времени начала.
+        Токенизирует ноты из [start_sec, end_sec) с TIME_SHIFT относительно
+        начала сегмента. Ноты глобально сортируются по времени начала.
         """
         tokens = []
         try:
@@ -322,11 +342,16 @@ class MusicTokenizer:
                 for note in instrument.notes:
                     if start_sec <= note.start < end_sec:
                         all_notes.append(note)
-            all_notes.sort(key=lambda n: n.start)
+            all_notes.sort(key=lambda n: (n.start, n.pitch))
+
+            prev_start = start_sec   # отсчёт от начала окна
             for note in all_notes:
+                time_shift = note.start - prev_start
+                tokens.append(f"TIME_{self._quantize_time_shift(time_shift)}")
                 tokens.append(f"PITCH_{note.pitch}")
                 tokens.append(f"VEL_{min(note.velocity // 10, 9)}")
                 tokens.append(f"DUR_{self._quantize_duration(note.end - note.start)}")
+                prev_start = note.start
         except Exception:
             pass
         return self.encode(['<SOS>'] + tokens + ['<EOS>'])
@@ -368,7 +393,7 @@ class MusicTransformerDecoder(nn.Module):
     Принимает memory из энкодера и авторегрессивно генерирует токены.
     """
 
-    def __init__(self, vocab_size, hidden_dim=512, num_layers=6, dropout=0.2, max_len=1000):
+    def __init__(self, vocab_size, hidden_dim=512, num_layers=6, dropout=0.2, max_len=1500):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -511,7 +536,7 @@ class AudioMusicDataset(Dataset):
 
     def __init__(self, data_dir, tokenizer, sample_rate=22050, n_fft=2048,
                  hop_length=512, max_audio_len=10, generate_audio_from_midi=True,
-                 max_samples=500):
+                 max_samples=0, segment_overlap=0.5):
         self.data_dir = Path(data_dir)
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
@@ -520,18 +545,20 @@ class AudioMusicDataset(Dataset):
         self.max_audio_len = max_audio_len
         self.generate_audio_from_midi = generate_audio_from_midi
         self.max_samples = max_samples
+        self.segment_overlap = float(np.clip(segment_overlap, 0.0, 0.9))
 
         # Используем кэш для ускорения загрузки
         self.cache = {}
         self.use_cache = True
 
-        print(f"Initializing GPU-optimized dataset from: {self.data_dir}")
+        print(f"Initializing dataset from: {self.data_dir}  "
+              f"(overlap={self.segment_overlap:.0%})")
 
         # Собираем пары аудио-MIDI
         self.pairs = self._collect_pairs()
 
-        # Ограничиваем количество пар для быстрого прототипирования
-        if len(self.pairs) > self.max_samples:
+        # max_samples=0 означает «все данные»
+        if self.max_samples > 0 and len(self.pairs) > self.max_samples:
             print(f"Limiting dataset from {len(self.pairs)} to {self.max_samples} samples")
             self.pairs = self.pairs[:self.max_samples]
 
@@ -550,14 +577,14 @@ class AudioMusicDataset(Dataset):
 
     def _collect_pairs(self):
         """
-        Собирает сегменты (audio_path, midi_path, start_sec).
+        Собирает сегменты (audio_path, midi_path, start_sec) с перекрытием.
 
-        Каждый трек нарезается на окна длиной max_audio_len секунд.
-        Например, трек 45 секунд → 4 сегмента: 0-10, 10-20, 20-30, 30-40
-        (последние секунды отбрасываются только если они короче окна).
+        Шаг между сегментами: chunk_sec * (1 - segment_overlap).
+        Например, при overlap=0.5 и chunk=10с: 0-10, 5-15, 10-20, ...
         """
         chunk_sec = self.max_audio_len
-        pairs = []
+        step      = chunk_sec * (1.0 - self.segment_overlap)
+        pairs     = []
 
         midi_extensions = ['.mid', '.midi']
         midi_files = []
@@ -579,11 +606,10 @@ class AudioMusicDataset(Dataset):
         for midi_file in midi_files:
             if self.generate_audio_from_midi:
                 total_dur = self._get_total_duration(midi_file)
-                n_chunks  = max(1, int(total_dur / chunk_sec))
-                for i in range(n_chunks):
-                    start = i * chunk_sec
-                    if start < total_dur:
-                        pairs.append((midi_file, midi_file, start))
+                start = 0.0
+                while start + chunk_sec <= total_dur + 0.5:
+                    pairs.append((midi_file, midi_file, start))
+                    start += step
             else:
                 audio_extensions = ['.wav', '.mp3', '.flac', '.ogg']
                 possible = [midi_file.with_suffix(ext) for ext in audio_extensions]
@@ -594,14 +620,15 @@ class AudioMusicDataset(Dataset):
                 audio_file = next((p for p in possible if p.exists()), None)
                 if audio_file:
                     total_dur = self._get_total_duration(audio_file)
-                    n_chunks  = max(1, int(total_dur / chunk_sec))
-                    for i in range(n_chunks):
-                        start = i * chunk_sec
-                        if start < total_dur:
-                            pairs.append((audio_file, midi_file, start))
+                    start = 0.0
+                    while start + chunk_sec <= total_dur + 0.5:
+                        pairs.append((audio_file, midi_file, start))
+                        start += step
 
         if not pairs:
             print("No audio-MIDI pairs found!")
+        else:
+            print(f"Total segments after overlap splitting: {len(pairs)}")
         return pairs
 
     def _midi_to_audio_segment(self, midi_path, start_sec: float) -> np.ndarray:
@@ -665,7 +692,7 @@ class AudioMusicDataset(Dataset):
                 token_ids = [1, 2]  # SOS, EOS
 
             token_tensor = torch.LongTensor(token_ids)
-            max_token_len = 500
+            max_token_len = 750
             if len(token_tensor) > max_token_len:
                 token_tensor = token_tensor[:max_token_len]
             else:
@@ -679,10 +706,35 @@ class AudioMusicDataset(Dataset):
 
         except Exception as e:
             print(f"Error processing item {idx}: {e}")
-            return (torch.zeros(1, 128, 431), torch.zeros(500, dtype=torch.long))
+            return (torch.zeros(1, 128, 431), torch.zeros(750, dtype=torch.long))
 
     def __len__(self):
         return len(self.pairs)
+
+
+# ==================== SpecAugment ====================
+
+def spec_augment(spec: torch.Tensor,
+                 freq_mask_param: int = 15,
+                 num_freq_masks: int = 2,
+                 time_mask_param: int = 30,
+                 num_time_masks: int = 2) -> torch.Tensor:
+    """
+    SpecAugment: случайные маски по частотной и временной осям.
+    spec: [B, 1, F, T]
+    """
+    x = spec.clone()
+    F_dim = x.size(2)
+    T_dim = x.size(3)
+    for _ in range(num_freq_masks):
+        f = random.randint(0, freq_mask_param)
+        f0 = random.randint(0, max(1, F_dim - f))
+        x[:, :, f0:f0 + f, :] = 0.0
+    for _ in range(num_time_masks):
+        t = random.randint(0, time_mask_param)
+        t0 = random.randint(0, max(1, T_dim - t))
+        x[:, :, :, t0:t0 + t] = 0.0
+    return x
 
 
 # ==================== Trainer (GPU оптимизированный) ====================
@@ -701,9 +753,9 @@ class Audio2MusicTrainer:
 
     def __init__(self, model, tokenizer, device=device,
                  label_smoothing: float = 0.1,
-                 warmup_epochs: int = 3,
-                 accum_steps: int = 1,
-                 early_stopping_patience: int = 7):
+                 warmup_epochs: int = 6,
+                 accum_steps: int = 2,
+                 early_stopping_patience: int = 15):
         self.device   = device
         self.model    = model.to(self.device)
         self.tokenizer = tokenizer
@@ -823,6 +875,9 @@ class Audio2MusicTrainer:
 
             audio_features = audio_features.to(self.device, non_blocking=True)
             target_tokens  = target_tokens.to(self.device,  non_blocking=True)
+
+            # SpecAugment: применяем только во время обучения
+            audio_features = spec_augment(audio_features)
 
             if audio_features.shape[0] == 0 or target_tokens.shape[0] == 0:
                 continue
@@ -1136,7 +1191,7 @@ class Audio2MusicTrainer:
 
 # ==================== Data Preparation ====================
 
-def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_workers=2, max_samples=20000):
+def prepare_training_data_gpu(data_dir='S:/Music Dataset', batch_size=4, num_workers=2, max_samples=0):
     """Подготовка данных для обучения с GPU оптимизацией"""
 
     print(f"\nPreparing data from: {data_dir}")
@@ -1594,8 +1649,8 @@ def main():
     if device.type == 'cuda':
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
         if gpu_memory_gb >= 8:
-            hidden_dim = 512
-            encoder_layers = 4
+            hidden_dim = 768
+            encoder_layers = 6
             decoder_layers = 6
             print(f"Large GPU ({gpu_memory_gb:.1f}GB): Using full model")
         elif gpu_memory_gb >= 4:

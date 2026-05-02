@@ -372,7 +372,7 @@ def train_on_data_dir(
     recursive: bool = False,
     batch_size: int = 4,
     epochs: int = None,       # None = автоподбор по размеру датасета
-    max_samples: int = 20000,
+    max_samples: int = 0,
 ):
     """
     Обучает модель на папке с wav+midi парами.
@@ -455,8 +455,8 @@ def train_on_data_dir(
 
     if device.type == 'cuda':
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-        hidden_dim     = 512 if gpu_mem >= 8 else (384 if gpu_mem >= 4 else 256)
-        enc_layers     = 4   if gpu_mem >= 8 else (3   if gpu_mem >= 4 else 2)
+        hidden_dim     = 768 if gpu_mem >= 8 else (384 if gpu_mem >= 4 else 256)
+        enc_layers     = 6   if gpu_mem >= 8 else (3   if gpu_mem >= 4 else 2)
         dec_layers     = 6   if gpu_mem >= 8 else (4   if gpu_mem >= 4 else 3)
     else:
         hidden_dim, enc_layers, dec_layers = 256, 2, 3
@@ -601,7 +601,7 @@ def run_pipeline(
     scale_factor: float = 0.8,
     batch_size: int = 4,
     epochs: int = None,
-    max_samples: int = 20000,
+    max_samples: int = 0,
 ) -> dict:
     """
     Универсальный пайплайн. Три сценария:
