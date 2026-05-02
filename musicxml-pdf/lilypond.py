@@ -3,7 +3,8 @@ import sys
 import subprocess
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
-from music21 import converter, environment, metadata, stream, meter, key, tempo, chord, harmony, dynamics, instrument, note, interval, pitch, scale, analysis
+from music21 import converter, environment, metadata, stream, meter, key, tempo, chord, harmony, dynamics, instrument, \
+    note, interval, pitch, scale, analysis
 from music21.stream.base import Score
 import argparse
 import traceback
@@ -14,6 +15,7 @@ import statistics
 from note_analyzer import NoteAnalyzer
 from decimal import Decimal
 from fractions import Fraction
+
 
 class MusicJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -29,7 +31,6 @@ class MusicJSONEncoder(json.JSONEncoder):
         elif isinstance(obj, datetime):
             return obj.isoformat()
         elif hasattr(obj, '__dict__'):
-            # Для объектов с атрибутами
             return {k: v for k, v in obj.__dict__.items()
                     if not k.startswith('_')}
         elif isinstance(obj, (set, tuple)):
@@ -37,6 +38,7 @@ class MusicJSONEncoder(json.JSONEncoder):
         elif hasattr(obj, '__str__'):
             return str(obj)
         return super().default(obj)
+
 
 class MusicXMLtoPDFConverter:
     DEFAULT_LILYPOND_PATH = r"C:\Program Files\LilyPond\bin\lilypond.exe"
@@ -138,43 +140,180 @@ class MusicXMLtoPDFConverter:
                 unique_paths.append(path)
         return unique_paths
 
+    # ========== МЕТОДЫ ДЛЯ ПИАНО-РОЛЛА ==========
+    def _collect_piano_roll_data(self, score: Score) -> List[Dict[str, Any]]:
+        """
+        Собирает данные для построения пиано-ролла из всего произведения.
+        Возвращает список нот с абсолютным offset, длительностью, MIDI-высотой.
+        """
+        notes_data = []
+        try:
+            flat = score.flatten()
+            for element in flat.notes:  # включает Note и Chord
+                if isinstance(element, chord.Chord):
+                    for p in element.pitches:
+                        notes_data.append({
+                            'offset': element.offset,
+                            'duration': element.duration.quarterLength,
+                            'midi': p.midi,
+                            'pitch_name': p.nameWithOctave,
+                            'is_chord': True
+                        })
+                else:
+                    if not hasattr(element, 'pitch'):
+                        continue
+                    notes_data.append({
+                        'offset': element.offset,
+                        'duration': element.duration.quarterLength,
+                        'midi': element.pitch.midi,
+                        'pitch_name': element.pitch.nameWithOctave,
+                        'is_chord': False
+                    })
+        except Exception as e:
+            print(f"   ⚠ Ошибка при сборе данных для пиано-ролла: {e}")
+        return notes_data
+
+    def generate_piano_roll_pdf(self, score: Score, output_path: str) -> None:
+        """
+        Создаёт PDF с пиано-роллом (интервальной спектрограммой) нот.
+        """
+        try:
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.units import mm
+            import math
+
+            notes_data = self._collect_piano_roll_data(score)
+            if not notes_data:
+                print("   ⚠ Нет данных для построения пиано-ролла")
+                return
+
+            # Определяем границы
+            min_offset = min(n['offset'] for n in notes_data)
+            max_offset = max(n['offset'] + n['duration'] for n in notes_data)
+            time_range = max_offset - min_offset
+            if time_range == 0:
+                time_range = 1.0
+
+            min_midi = min(n['midi'] for n in notes_data)
+            max_midi = max(n['midi'] for n in notes_data)
+            midi_range = max_midi - min_midi
+            if midi_range == 0:
+                midi_range = 1
+
+            # Параметры страницы
+            page_width, page_height = landscape(A4)
+            margin = 20 * mm
+            plot_width = page_width - 2 * margin
+            plot_height = page_height - 2 * margin
+
+            x_scale = plot_width / time_range
+            y_scale = plot_height / midi_range
+
+            c = canvas.Canvas(output_path, pagesize=landscape(A4))
+            c.setTitle("Piano Roll / Interval Spectrogram")
+
+            # Белый фон
+            c.setFillColorRGB(1, 1, 1)
+            c.rect(0, 0, page_width, page_height, fill=1)
+
+            # Оси
+            c.setStrokeColorRGB(0, 0, 0)
+            c.setLineWidth(1)
+            c.line(margin, margin, page_width - margin, margin)
+            c.line(margin, margin, margin, page_height - margin)
+
+            # Подписи осей
+            c.setFont("Helvetica", 10)
+            c.drawString(page_width / 2, margin - 10, "Время (доли)")
+            c.saveState()
+            c.rotate(90)
+            c.drawString(page_height / 2, -margin + 5, "MIDI высота")
+            c.restoreState()
+
+            # Метки по оси Y (MIDI)
+            step = max(1, (max_midi - min_midi) // 10)
+            for midi in range(min_midi, max_midi + 1, step):
+                y = margin + (midi - min_midi) * y_scale
+                c.setFont("Helvetica", 8)
+                c.drawString(margin - 25, y - 3, str(midi))
+                c.setLineWidth(0.5)
+                c.setStrokeColorRGB(0.8, 0.8, 0.8)
+                c.line(margin, y, page_width - margin, y)
+
+            # Метки по оси X (такты)
+            measures = list(score.parts[0].getElementsByClass('Measure')) if score.parts else []
+            if measures:
+                measure_offsets = []
+                current_offset = 0.0
+                for m in measures:
+                    measure_offsets.append(current_offset)
+                    if hasattr(m, 'duration') and m.duration.quarterLength:
+                        current_offset += m.duration.quarterLength
+                    else:
+                        notes_in_measure = list(m.notes)
+                        if notes_in_measure:
+                            last_note = notes_in_measure[-1]
+                            current_offset = last_note.offset + last_note.duration.quarterLength
+                        else:
+                            current_offset += 1.0
+                for i, off in enumerate(measure_offsets):
+                    if off < min_offset or off > max_offset:
+                        continue
+                    x = margin + (off - min_offset) * x_scale
+                    c.setFont("Helvetica", 8)
+                    c.drawString(x - 5, margin - 15, str(i + 1))
+                    c.setLineWidth(0.5)
+                    c.setStrokeColorRGB(0.8, 0.8, 0.8)
+                    c.line(x, margin, x, page_height - margin)
+
+            # Рисуем ноты
+            c.setStrokeColorRGB(0, 0, 0)
+            c.setLineWidth(0.2)
+            for note in notes_data:
+                x = margin + (note['offset'] - min_offset) * x_scale
+                width = note['duration'] * x_scale
+                y = margin + (note['midi'] - min_midi) * y_scale
+                rect_height = 5  # пунктов
+                c.setFillColorRGB(0, 0, 1, 0.5)
+                c.rect(x, y - rect_height / 2, width, rect_height, fill=1, stroke=0)
+
+            # Заголовок
+            c.setFont("Helvetica-Bold", 14)
+            title = score.metadata.title if score.metadata and score.metadata.title else "Piano Roll"
+            c.drawString(margin, page_height - margin + 10, f"Piano Roll / Interval Spectrogram: {title}")
+
+            c.save()
+            print(f"   ✓ Пиано-ролл PDF создан: {Path(output_path).name}")
+
+        except Exception as e:
+            print(f"   ⚠ Ошибка при создании пиано-ролла PDF: {e}")
+            traceback.print_exc()
+
+    # ========== МЕТОДЫ АНАЛИЗА НОТ ==========
     def get_note_range_overlap(self, score: Score, start_measure: int = 1, end_measure: int = None) -> List[
         Dict[str, Any]]:
         """
         Возвращает интервал нот в указанном диапазоне с нахлестом (overlap).
-
-        Args:
-            score: Music21 Score объект
-            start_measure: начальный такт (1-based)
-            end_measure: конечный такт (None = до конца)
-
-        Returns:
-            Список словарей с характеристиками нот и их токенами
         """
         notes_info = []
 
         try:
             for i, part in enumerate(score.parts):
                 part_name = getattr(part, 'partName', f'Part {i + 1}')
-
-                # Получаем такты
                 measures = list(part.getElementsByClass('Measure'))
 
                 if not measures:
                     continue
 
-                # Определяем конечный такт
                 if end_measure is None:
                     end_measure = len(measures)
                 else:
                     end_measure = min(end_measure, len(measures))
 
-                # Собираем ноты из указанного диапазона
                 for measure_idx in range(max(0, start_measure - 1), end_measure):
                     measure = measures[measure_idx]
                     measure_num = measure_idx + 1
-
-                    # Получаем все ноты в такте
                     measure_notes = list(measure.notes)
 
                     for j, n in enumerate(measure_notes):
@@ -193,7 +332,6 @@ class MusicXMLtoPDFConverter:
                             print(f"Ошибка обработки ноты: {e}")
                             continue
 
-            # Добавляем информацию о связях между нотами
             self._add_note_relations(notes_info)
 
         except Exception as e:
@@ -202,13 +340,8 @@ class MusicXMLtoPDFConverter:
         return notes_info
 
     def _create_note_token(self, note_obj: note.Note) -> str:
-        """
-        Создает уникальный токен для ноты.
-
-        Формат: P{part_id}M{measure}N{note_index}_{pitch}_{duration}_{articulations}
-        """
+        """Создает уникальный токен для ноты."""
         try:
-            # Базовые характеристики
             if hasattr(note_obj, 'pitch'):
                 pitch_str = str(note_obj.pitch)
             else:
@@ -220,30 +353,22 @@ class MusicXMLtoPDFConverter:
             else:
                 duration_str = "D0"
 
-            # Артикуляция
             articulations = []
             if hasattr(note_obj, 'articulations'):
                 for art in note_obj.articulations:
                     articulations.append(str(art))
-
             articulation_str = "_".join(articulations) if articulations else "no_articulation"
 
-            # Динамика
-            dynamics = []
+            dynamics_list = []
             if hasattr(note_obj, 'expressions'):
                 for expr in note_obj.expressions:
                     if isinstance(expr, dynamics.Dynamic):
-                        dynamics.append(str(expr))
+                        dynamics_list.append(str(expr))
+            dynamic_str = "_".join(dynamics_list) if dynamics_list else "no_dynamic"
 
-            dynamic_str = "_".join(dynamics) if dynamics else "no_dynamic"
-
-            # Создаем токен
             token = f"{pitch_str}_{duration_str}_{articulation_str}_{dynamic_str}"
-
-            # Хешируем для уникальности
             import hashlib
             token_hash = hashlib.md5(token.encode()).hexdigest()[:8]
-
             return f"NOTE_{token_hash}"
 
         except Exception as e:
@@ -260,14 +385,12 @@ class MusicXMLtoPDFConverter:
         }
 
         try:
-            # Базовые характеристики
             characteristics['basic'] = {
                 'type': note_obj.className,
                 'is_rest': isinstance(note_obj, note.Rest),
                 'is_chord': isinstance(note_obj, chord.Chord)
             }
 
-            # Информация о высоте звука
             if hasattr(note_obj, 'pitch'):
                 p = note_obj.pitch
                 characteristics['pitch_info'] = {
@@ -282,7 +405,6 @@ class MusicXMLtoPDFConverter:
                     'spelling': self._get_pitch_spelling(p)
                 }
 
-            # Ритмическая информация
             if hasattr(note_obj, 'duration'):
                 d = note_obj.duration
                 characteristics['rhythmic_info'] = {
@@ -295,7 +417,6 @@ class MusicXMLtoPDFConverter:
                     'duration_components': self._get_duration_components(d)
                 }
 
-            # Исполнительская информация
             characteristics['performance_info'] = {
                 'articulations': [str(a) for a in note_obj.articulations] if hasattr(note_obj, 'articulations') else [],
                 'expressions': [str(e) for e in note_obj.expressions] if hasattr(note_obj, 'expressions') else [],
@@ -304,14 +425,12 @@ class MusicXMLtoPDFConverter:
                 'stem_direction': note_obj.stemDirection if hasattr(note_obj, 'stemDirection') else None
             }
 
-            # Контекстная информация
             if hasattr(note_obj, 'volume'):
                 characteristics['performance_info']['volume'] = {
                     'velocity': note_obj.volume.velocity,
                     'velocity_is_relative': note_obj.volume.velocityIsRelative
                 }
 
-            # Теоретическая информация
             characteristics['theoretical_info'] = {
                 'scale_degree': self._get_scale_degree(note_obj),
                 'harmonic_function': self._estimate_harmonic_function(note_obj),
@@ -324,12 +443,7 @@ class MusicXMLtoPDFConverter:
         return characteristics
 
     def _get_overlap_info(self, current_note: note.Note, measure_notes: List, position: int) -> Dict[str, Any]:
-        """
-        Анализирует нахлест ноты с соседними нотами.
-
-        Returns:
-            Информация о перекрытии с предыдущими и последующими нотами
-        """
+        """Анализирует нахлест ноты с соседними нотами."""
         overlap_info = {
             'previous_overlap': None,
             'next_overlap': None,
@@ -337,7 +451,6 @@ class MusicXMLtoPDFConverter:
         }
 
         try:
-            # Проверяем перекрытие с предыдущей нотой
             if position > 0:
                 prev_note = measure_notes[position - 1]
                 if self._notes_overlap(prev_note, current_note):
@@ -347,7 +460,6 @@ class MusicXMLtoPDFConverter:
                         'overlap_ratio': self._calculate_overlap_ratio(prev_note, current_note)
                     }
 
-            # Проверяем перекрытие со следующей нотой
             if position < len(measure_notes) - 1:
                 next_note = measure_notes[position + 1]
                 if self._notes_overlap(current_note, next_note):
@@ -357,9 +469,7 @@ class MusicXMLtoPDFConverter:
                         'overlap_ratio': self._calculate_overlap_ratio(current_note, next_note)
                     }
 
-            # Находим ноты, звучащие одновременно
             if position > 0:
-                # Проверяем все предыдущие ноты на одновременное звучание
                 for i in range(position):
                     other_note = measure_notes[i]
                     if self._notes_simultaneous(other_note, current_note):
@@ -379,15 +489,11 @@ class MusicXMLtoPDFConverter:
         try:
             if not hasattr(note1, 'offset') or not hasattr(note2, 'offset'):
                 return False
-
             if not hasattr(note1, 'duration') or not hasattr(note2, 'duration'):
                 return False
-
             end1 = note1.offset + note1.duration.quarterLength
             start2 = note2.offset
-
             return end1 > start2
-
         except:
             return False
 
@@ -396,13 +502,9 @@ class MusicXMLtoPDFConverter:
         try:
             if not hasattr(note1, 'offset') or not hasattr(note2, 'offset'):
                 return False
-
             start1 = note1.offset
             start2 = note2.offset
-
-            # Считаем ноты одновременными, если их начала совпадают
             return abs(start1 - start2) < 0.01
-
         except:
             return False
 
@@ -411,16 +513,12 @@ class MusicXMLtoPDFConverter:
         try:
             if not self._notes_overlap(note1, note2):
                 return "no_overlap"
-
             end1 = note1.offset + note1.duration.quarterLength
             start2 = note2.offset
-
             overlap_amount = end1 - start2
 
-            # Процент перекрытия относительно длительности первой ноты
             if hasattr(note1, 'duration'):
                 overlap_percentage = overlap_amount / note1.duration.quarterLength
-
                 if overlap_percentage < 0.1:
                     return "slight_overlap"
                 elif overlap_percentage < 0.3:
@@ -429,9 +527,7 @@ class MusicXMLtoPDFConverter:
                     return "significant_overlap"
                 else:
                     return "heavy_overlap"
-
             return "overlap"
-
         except:
             return "unknown"
 
@@ -440,18 +536,12 @@ class MusicXMLtoPDFConverter:
         try:
             if not self._notes_overlap(note1, note2):
                 return 0.0
-
             end1 = note1.offset + note1.duration.quarterLength
             start2 = note2.offset
-
             overlap_amount = end1 - start2
-
-            # Коэффициент относительно более короткой ноты
             duration1 = note1.duration.quarterLength
             duration2 = note2.duration.quarterLength
-
             return overlap_amount / min(duration1, duration2)
-
         except:
             return 0.0
 
@@ -469,7 +559,6 @@ class MusicXMLtoPDFConverter:
         try:
             if hasattr(note1, 'pitch') and hasattr(note2, 'pitch'):
                 intv = interval.Interval(noteStart=note1.pitch, noteEnd=note2.pitch)
-
                 interval_info['simple_name'] = intv.simpleName
                 interval_info['compound_name'] = intv.name
                 interval_info['semitones'] = intv.semitones
@@ -478,13 +567,10 @@ class MusicXMLtoPDFConverter:
                 interval_info['diatonic'] = intv.diatonic.name if hasattr(intv.diatonic, 'name') else str(intv.diatonic)
                 interval_info['chromatic'] = intv.chromatic.name if hasattr(intv.chromatic, 'name') else str(
                     intv.chromatic)
-
-                # Дополнительная информация
                 interval_info['is_consonant'] = intv.isConsonant()
                 interval_info['is_dissonant'] = intv.isDissonant()
                 interval_info['is_perfect'] = intv.isPerfectType
                 interval_info['generic'] = intv.generic.simpleUndirected
-
         except Exception as e:
             interval_info['error'] = str(e)
 
@@ -495,7 +581,6 @@ class MusicXMLtoPDFConverter:
         for i in range(len(notes_info)):
             current_note = notes_info[i]
 
-            # Связь с предыдущей нотой
             if i > 0:
                 prev_note = notes_info[i - 1]
                 current_note['relations'] = current_note.get('relations', {})
@@ -511,7 +596,6 @@ class MusicXMLtoPDFConverter:
                     )
                 }
 
-            # Связь со следующей нотой
             if i < len(notes_info) - 1:
                 next_note = notes_info[i + 1]
                 current_note['relations'] = current_note.get('relations', {})
@@ -529,7 +613,6 @@ class MusicXMLtoPDFConverter:
             if hasattr(note1, 'offset') and hasattr(note2, 'offset'):
                 end1 = note1.offset + note1.duration.quarterLength
                 start2 = note2.offset
-
                 return max(0, start2 - end1)
         except:
             pass
@@ -544,16 +627,10 @@ class MusicXMLtoPDFConverter:
         }
 
         try:
-            # Получаем альтернативные написания
             enharmonics = pitch_obj.getAllCommonEnharmonics()
             spelling['enharmonic_spellings'] = [str(p) for p in enharmonics]
-
-            # Предпочтительное написание
             spelling['preferred_spelling'] = pitch_obj.nameWithOctave
-
-            # Проверяем на неоднозначность
             spelling['spelling_ambiguity'] = len(enharmonics) > 1
-
         except:
             pass
 
@@ -564,7 +641,6 @@ class MusicXMLtoPDFConverter:
         components = []
 
         try:
-            # Для тюплетов
             if hasattr(duration_obj, 'tuplets') and duration_obj.tuplets:
                 for tuplet in duration_obj.tuplets:
                     components.append({
@@ -574,7 +650,6 @@ class MusicXMLtoPDFConverter:
                         'duration_notes': tuplet.numberNotesNormal
                     })
 
-            # Основная длительность
             components.append({
                 'type': 'base',
                 'duration': duration_obj.quarterLength,
@@ -592,120 +667,87 @@ class MusicXMLtoPDFConverter:
         """Определяет ступень лада для ноты."""
         try:
             if hasattr(note_obj, 'pitch'):
-                # Это упрощенная версия - в реальности нужен анализ лада
                 p = note_obj.pitch
                 midi_num = p.midi
-
-                # Простая эвристика для мажора
-                scale_notes = [0, 2, 4, 5, 7, 9, 11]  # Мажорный лад
-
+                scale_notes = [0, 2, 4, 5, 7, 9, 11]
                 degree = (midi_num % 12)
                 if degree in scale_notes:
                     return scale_notes.index(degree) + 1
         except:
             pass
-
         return None
 
     def _estimate_harmonic_function(self, note_obj: note.Note) -> str:
         """Оценивает гармоническую функцию ноты."""
-        # Упрощенная версия
         return "undefined"
 
     def _get_melodic_contour(self, note_obj: note.Note) -> str:
         """Определяет мелодический контур."""
-        # Упрощенная версия
         return "stable"
 
     def get_note_subset_by_criteria(self, notes_info: List[Dict[str, Any]],
                                     criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Возвращает подмножество нот по заданным критериям.
-
-        Args:
-            notes_info: Список информации о нотах
-            criteria: Словарь с критериями фильтрации
-
-        Available criteria:
-            - pitch_range: {'min': midi_min, 'max': midi_max}
-            - duration_range: {'min': min_duration, 'max': max_duration}
-            - articulation_types: ['staccato', 'tenuto', ...]
-            - dynamic_levels: ['p', 'mp', 'mf', 'f', ...]
-            - overlap_type: ['slight_overlap', 'moderate_overlap', ...]
-            - scale_degree: [1, 3, 5, ...]
-            - measure_range: {'start': measure_start, 'end': measure_end}
         """
         filtered_notes = []
-
         for note_info in notes_info:
             if self._meets_criteria(note_info, criteria):
                 filtered_notes.append(note_info)
-
         return filtered_notes
 
     def _meets_criteria(self, note_info: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
         """Проверяет, удовлетворяет ли нота критериям."""
         try:
-            # Проверка диапазона высоты
             if 'pitch_range' in criteria:
                 pitch_info = note_info['characteristics'].get('pitch_info', {})
                 midi_num = pitch_info.get('midi_number')
                 if midi_num is None:
                     return False
-
                 pitch_range = criteria['pitch_range']
                 if not (pitch_range.get('min', 0) <= midi_num <= pitch_range.get('max', 127)):
                     return False
 
-            # Проверка диапазона длительности
             if 'duration_range' in criteria:
                 rhythmic_info = note_info['characteristics'].get('rhythmic_info', {})
                 duration = rhythmic_info.get('quarter_length')
                 if duration is None:
                     return False
-
                 dur_range = criteria['duration_range']
                 if not (dur_range.get('min', 0) <= duration <= dur_range.get('max', float('inf'))):
                     return False
 
-            # Проверка артикуляции
             if 'articulation_types' in criteria:
                 perf_info = note_info['characteristics'].get('performance_info', {})
                 articulations = perf_info.get('articulations', [])
                 required_articulations = criteria['articulation_types']
-
                 if required_articulations:
                     has_required = any(art.lower() in [a.lower() for a in articulations]
                                        for art in required_articulations)
                     if not has_required:
                         return False
 
-            # Проверка динамики
             if 'dynamic_levels' in criteria:
                 perf_info = note_info['characteristics'].get('performance_info', {})
                 expressions = perf_info.get('expressions', [])
                 required_dynamics = criteria['dynamic_levels']
-
                 if required_dynamics:
                     has_required = any(dyn.lower() in [e.lower() for e in expressions]
                                        for dyn in required_dynamics)
                     if not has_required:
                         return False
 
-            # Проверка типа перекрытия
             if 'overlap_type' in criteria:
                 overlap_type = note_info.get('overlap_info', {}).get('previous_overlap', {}).get('overlap_type')
                 if overlap_type not in criteria['overlap_type']:
                     return False
 
-            # Проверка ступени лада
             if 'scale_degree' in criteria:
                 theoretical_info = note_info['characteristics'].get('theoretical_info', {})
                 degree = theoretical_info.get('scale_degree')
                 if degree not in criteria['scale_degree']:
                     return False
 
-            # Проверка диапазона тактов
             if 'measure_range' in criteria:
                 measure = note_info.get('measure')
                 measure_range = criteria['measure_range']
@@ -721,9 +763,6 @@ class MusicXMLtoPDFConverter:
     def analyze_note_patterns(self, notes_info: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Анализирует паттерны в последовательности нот.
-
-        Returns:
-            Словарь с обнаруженными паттернами
         """
         patterns = {
             'repetitions': [],
@@ -734,21 +773,11 @@ class MusicXMLtoPDFConverter:
         }
 
         try:
-            # Поиск повторяющихся последовательностей
             patterns['repetitions'] = self._find_repetitions(notes_info)
-
-            # Поиск секвенций
             patterns['sequences'] = self._find_sequences(notes_info)
-
-            # Анализ интервальных паттернов
             patterns['intervallic_patterns'] = self._analyze_intervallic_patterns(notes_info)
-
-            # Анализ ритмических паттернов
             patterns['rhythmic_patterns'] = self._analyze_rhythmic_patterns(notes_info)
-
-            # Анализ мелодического контура
             patterns['contour_patterns'] = self._analyze_contour_patterns(notes_info)
-
         except Exception as e:
             patterns['error'] = str(e)
 
@@ -757,17 +786,11 @@ class MusicXMLtoPDFConverter:
     def _find_repetitions(self, notes_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Находит повторяющиеся последовательности нот."""
         repetitions = []
-
         try:
-            # Извлекаем последовательности токенов
             tokens = [note['token'] for note in notes_info]
-
-            # Ищем повторения длиной от 2 до 6 нот
             for length in range(2, min(7, len(tokens) // 2 + 1)):
                 for i in range(len(tokens) - length):
                     sequence = tokens[i:i + length]
-
-                    # Ищем такую же последовательность дальше
                     for j in range(i + length, len(tokens) - length + 1):
                         if tokens[j:j + length] == sequence:
                             repetition = {
@@ -783,23 +806,40 @@ class MusicXMLtoPDFConverter:
                                 ]
                             }
                             repetitions.append(repetition)
-
         except Exception as e:
             print(f"Ошибка при поиске повторений: {e}")
-
         return repetitions
+
+    def _find_sequences(self, notes_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Находит секвенции (повторяющиеся паттерны с транспозицией)."""
+        sequences = []
+        # Упрощенная реализация
+        return sequences
+
+    def _analyze_intervallic_patterns(self, notes_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Анализирует интервальные паттерны."""
+        patterns = []
+        # Упрощенная реализация
+        return patterns
+
+    def _analyze_rhythmic_patterns(self, notes_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Анализирует ритмические паттерны."""
+        patterns = []
+        # Упрощенная реализация
+        return patterns
+
+    def _analyze_contour_patterns(self, notes_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Анализирует паттерны мелодического контура."""
+        patterns = []
+        # Упрощенная реализация
+        return patterns
 
     def export_note_analysis(self, notes_info: List[Dict[str, Any]],
                              output_path: str) -> None:
         """
         Экспортирует анализ нот в JSON файл.
-
-        Args:
-            notes_info: Список информации о нотах
-            output_path: Путь для сохранения файла
         """
         try:
-            # Подготавливаем данные для экспорта
             export_data = {
                 'metadata': {
                     'total_notes': len(notes_info),
@@ -811,7 +851,6 @@ class MusicXMLtoPDFConverter:
                 'patterns': self.analyze_note_patterns(notes_info)
             }
 
-            # Добавляем информацию о нотах (упрощаем для экспорта)
             for note_info in notes_info:
                 simplified_note = {
                     'token': note_info['token'],
@@ -827,7 +866,6 @@ class MusicXMLtoPDFConverter:
                 }
                 export_data['notes'].append(simplified_note)
 
-            # Сохраняем в JSON
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(export_data, f, indent=2, ensure_ascii=False)
 
@@ -854,58 +892,41 @@ class MusicXMLtoPDFConverter:
         }
 
         try:
-            # Статистика по высотам
             midi_numbers = []
             pitch_counts = {}
-
-            # Статистика по длительностям
             durations = []
             duration_counts = {}
-
-            # Статистика по артикуляции
             articulation_counts = {}
-
-            # Статистика по перекрытию
             overlap_counts = {}
 
             for note_info in notes_info:
-                # Высота
                 pitch_info = note_info['characteristics'].get('pitch_info', {})
                 midi_num = pitch_info.get('midi_number')
                 if midi_num is not None:
                     midi_numbers.append(midi_num)
-
                     pitch_name = pitch_info.get('name')
                     if pitch_name:
                         pitch_counts[pitch_name] = pitch_counts.get(pitch_name, 0) + 1
 
-                # Длительность
                 rhythmic_info = note_info['characteristics'].get('rhythmic_info', {})
                 duration = rhythmic_info.get('quarter_length')
                 if duration is not None:
                     durations.append(duration)
-
-                    # Группируем по типам длительностей
                     dur_type = rhythmic_info.get('type', 'unknown')
                     duration_counts[dur_type] = duration_counts.get(dur_type, 0) + 1
 
-                # Артикуляции
                 perf_info = note_info['characteristics'].get('performance_info', {})
                 for articulation in perf_info.get('articulations', []):
                     articulation_counts[articulation] = articulation_counts.get(articulation, 0) + 1
 
-                # Перекрытие
                 overlap_type = note_info.get('overlap_info', {}).get('previous_overlap', {}).get('overlap_type')
                 if overlap_type:
                     overlap_counts[overlap_type] = overlap_counts.get(overlap_type, 0) + 1
 
-            # Заполняем сводку
             if midi_numbers:
                 summary['pitch_statistics']['range']['min'] = min(midi_numbers)
                 summary['pitch_statistics']['range']['max'] = max(midi_numbers)
                 summary['pitch_statistics']['average'] = sum(midi_numbers) / len(midi_numbers)
-
-                # Самые частые высоты
                 sorted_pitches = sorted(pitch_counts.items(), key=lambda x: x[1], reverse=True)[:5]
                 summary['pitch_statistics']['common_pitches'] = sorted_pitches
 
@@ -923,17 +944,13 @@ class MusicXMLtoPDFConverter:
 
         return summary
 
-    # Внутри класса можно добавить следующий метод для демонстрации:
-
     def demonstrate_note_analysis(self, score: Score):
-        """Демонстрация нового функционала анализа нот."""
-
+        """Демонстрация функционала анализа нот."""
         notes_in_range = self.get_note_range_overlap(score, start_measure=1, end_measure=10)
-
         print(f"Найдено нот в диапазоне: {len(notes_in_range)}")
 
         criteria = {
-            'pitch_range': {'min': 60, 'max': 72},  # От C4 до C5
+            'pitch_range': {'min': 60, 'max': 72},
             'duration_range': {'min': 0.5, 'max': 2.0},
             'articulation_types': ['staccato', 'accent']
         }
@@ -963,66 +980,7 @@ class MusicXMLtoPDFConverter:
             'patterns_found': sum(len(v) for v in patterns.values() if isinstance(v, list))
         }
 
-    def analyze_notes_in_range(self, input_path: str, start_measure: int = 1,
-                               end_measure: Optional[int] = None,
-                               part_index: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Анализирует ноты в указанном диапазоне и возвращает результаты.
-
-        Args:
-            input_path: путь к MusicXML файлу
-            start_measure: начальный такт
-            end_measure: конечный такт
-            part_index: индекс партии
-
-        Returns:
-            Результаты анализа
-        """
-        try:
-            # Загружаем файл
-            score = converter.parse(str(input_path))
-
-            # Получаем ноты в диапазоне
-            notes_info = NoteAnalyzer.get_note_range_overlap(
-                score, start_measure, end_measure, part_index
-            )
-
-            # Получаем интервалы
-            intervals = NoteAnalyzer.get_note_intervals(notes_info)
-
-            # Получаем статистику
-            statistics = NoteAnalyzer.get_note_statistics(notes_info)
-
-            return {
-                'notes': notes_info,
-                'intervals': intervals,
-                'statistics': statistics,
-                'total_notes': len(notes_info),
-                'total_intervals': len(intervals)
-            }
-
-        except Exception as e:
-            print(f"Ошибка при анализе нот: {e}")
-            return {'error': str(e)}
-
-    def export_note_analysis_to_json(self, input_path: str, output_path: str,
-                                     start_measure: int = 1,
-                                     end_measure: Optional[int] = None) -> None:
-        """
-        Экспортирует анализ нот в JSON файл.
-        """
-        try:
-            score = converter.parse(str(input_path))
-            notes_info = NoteAnalyzer.get_note_range_overlap(
-                score, start_measure, end_measure
-            )
-
-            NoteAnalyzer.export_to_json(notes_info, output_path)
-            print(f"✓ Анализ нот экспортирован в: {output_path}")
-
-        except Exception as e:
-            print(f"Ошибка при экспорте анализа: {e}")
-
+    # ========== МЕТОДЫ АНАЛИЗА МЕТАДАННЫХ ==========
     def extract_structural_metadata(self, score: Score) -> Dict[str, Any]:
         print("   Извлечение структурных метаданных...")
 
@@ -1076,7 +1034,6 @@ class MusicXMLtoPDFConverter:
             parts_info.append(part_info)
             total_measures = max(total_measures, part_info["measures_count"])
 
-            # Извлекаем метры
             try:
                 flat_part = part.flatten()
                 for ts in flat_part.getElementsByClass(meter.TimeSignature):
@@ -1085,7 +1042,6 @@ class MusicXMLtoPDFConverter:
             except:
                 pass
 
-            # Извлекаем тональности
             try:
                 flat_part = part.flatten()
                 for ks in flat_part.getElementsByClass(key.KeySignature):
@@ -1095,7 +1051,6 @@ class MusicXMLtoPDFConverter:
             except:
                 pass
 
-            # Извлекаем темпы
             try:
                 flat_part = part.flatten()
                 for t in flat_part.getElementsByClass(tempo.TempoIndication):
@@ -1112,7 +1067,7 @@ class MusicXMLtoPDFConverter:
             "total_measures": total_measures,
             "time_signatures": list(time_signatures),
             "key_signatures": list(key_signatures),
-            "tempos": list({json.dumps(t, sort_keys=True): t for t in tempos}.values())  # Убираем дубликаты
+            "tempos": list({json.dumps(t, sort_keys=True): t for t in tempos}.values())
         }
 
         # 5. Статистическая информация
@@ -1149,16 +1104,12 @@ class MusicXMLtoPDFConverter:
         part_instruments = []
 
         for i, part in enumerate(score.parts):
-            # Поиск информации об инструменте
             detected_instrument = self._detect_instrument(part)
             instruments.append(detected_instrument)
             part_instruments.append(detected_instrument)
-
-            # Определяем семейство инструмента
             family = self._get_instrument_family(detected_instrument)
             instrument_families.add(family)
 
-        # Подсчет уникальных инструментов
         unique_instruments = {}
         for instr in instruments:
             if instr in unique_instruments:
@@ -1176,11 +1127,9 @@ class MusicXMLtoPDFConverter:
 
     def _detect_instrument(self, part) -> str:
         """Определяет инструмент по различным признакам."""
-        # 1. Проверяем явное указание инструмента
         if hasattr(part, 'instrumentName') and part.instrumentName:
             return str(part.instrumentName)
 
-        # 2. Ищем объекты Instrument в партии
         try:
             for elem in part.recurse().getElementsByClass('Instrument'):
                 if hasattr(elem, 'instrumentName') and elem.instrumentName:
@@ -1188,7 +1137,6 @@ class MusicXMLtoPDFConverter:
         except:
             pass
 
-        # 3. Анализируем MIDI-программу (если есть)
         try:
             midi_program = None
             for elem in part.recurse():
@@ -1197,7 +1145,6 @@ class MusicXMLtoPDFConverter:
                     break
 
             if midi_program is not None:
-                # Преобразуем MIDI program в название инструмента
                 instrument_names = {
                     0: "Acoustic Grand Piano", 24: "Acoustic Guitar (nylon)",
                     25: "Acoustic Guitar (steel)", 40: "Violin",
@@ -1214,7 +1161,6 @@ class MusicXMLtoPDFConverter:
         except:
             pass
 
-        # 4. Анализируем диапазон нот для предположения
         try:
             notes = list(part.flatten().notes)
             if notes:
@@ -1226,7 +1172,6 @@ class MusicXMLtoPDFConverter:
                     min_pitch = min(pitches)
                     max_pitch = max(pitches)
 
-                    # Определяем по диапазону
                     if max_pitch < 40:
                         return "Контрабас или Туба"
                     elif max_pitch < 60:
@@ -1286,11 +1231,9 @@ class MusicXMLtoPDFConverter:
     def _analyze_harmony(self, score: Score) -> Dict[str, Any]:
         """Гармонический анализ."""
         chords = []
-        chord_progressions = []
         key_analysis = {"detected_key": None, "confidence": 0, "modulations": []}
 
         try:
-            # Анализ тональности
             for part in score.parts:
                 try:
                     flat_part = part.flatten()
@@ -1298,13 +1241,11 @@ class MusicXMLtoPDFConverter:
                     if key_sigs:
                         ks = key_sigs[0]
                         key_analysis["detected_key"] = str(ks)
-                        # Простая оценка уверенности
                         key_analysis["confidence"] = 0.8
                         break
                 except:
                     continue
 
-            # Сбор аккордов
             for part in score.parts:
                 try:
                     flat_part = part.flatten()
@@ -1320,7 +1261,6 @@ class MusicXMLtoPDFConverter:
                 except:
                     continue
 
-            # Анализ наиболее частых аккордов
             if chords:
                 chord_counts = {}
                 for ch in chords:
@@ -1329,7 +1269,6 @@ class MusicXMLtoPDFConverter:
 
                 most_common = sorted(chord_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
-                # Определяем тип гармонии
                 harmony_type = "Простая"
                 if len(chord_counts) > 10:
                     harmony_type = "Сложная"
@@ -1420,18 +1359,15 @@ class MusicXMLtoPDFConverter:
             except:
                 pass
 
-        # Статистика по высотам
         note_range = {"lowest": None, "highest": None}
         if pitches:
             note_range["lowest"] = min(pitches)
             note_range["highest"] = max(pitches)
 
-        # Статистика по длительностям
         average_duration = 0
         if durations:
             average_duration = sum(durations) / len(durations)
 
-        # Подсчет пауз
         total_rests = 0
         try:
             flat_score = score.flatten()
@@ -1489,17 +1425,13 @@ class MusicXMLtoPDFConverter:
         if not durations:
             return 0
 
-        # Мера разнообразия длительностей
         unique_durations = len(set(round(d, 2) for d in durations))
         total_notes = len(durations)
-
-        # Процент очень коротких нот
         short_notes = sum(1 for d in durations if d < 0.25)
         short_percentage = short_notes / total_notes
 
-        # Комбинированная оценка
         complexity = (unique_durations / 10 * 0.4) + (short_percentage * 0.6)
-        return round(min(complexity * 10, 10), 2)  # Нормализуем до 10
+        return round(min(complexity * 10, 10), 2)
 
     def _analyze_dynamics(self, score: Score) -> Dict[str, Any]:
         """Анализ динамических оттенков."""
@@ -1514,7 +1446,6 @@ class MusicXMLtoPDFConverter:
                     dynamics_list.append(dyn_text)
                     dynamic_levels.add(dyn_text)
 
-                # Также ищем текстовые указания динамики
                 for text in flat_part.getElementsByClass('TextExpression'):
                     text_str = str(text).lower()
                     if any(dyn in text_str for dyn in ['piano', 'forte', 'crescendo', 'diminuendo', 'sforzando']):
@@ -1522,7 +1453,6 @@ class MusicXMLtoPDFConverter:
         except:
             pass
 
-        # Анализ распределения динамики
         if dynamics_list:
             dynamic_counts = {}
             for dyn in dynamics_list:
@@ -1561,13 +1491,11 @@ class MusicXMLtoPDFConverter:
 
     def _analyze_form_structure(self, score: Score) -> Dict[str, Any]:
         """Анализ структуры формы."""
-        # Поиск структурных маркеров
         sections = []
         repeats = []
         endings = []
 
         try:
-            # Поиск повторений
             for elem in score.recurse():
                 elem_str = str(elem).lower()
                 if 'repeat' in elem_str:
@@ -1575,7 +1503,6 @@ class MusicXMLtoPDFConverter:
                 if 'ending' in elem_str or 'volta' in elem_str:
                     endings.append(str(elem))
 
-                # Поиск текстовых указаний формы
                 if hasattr(elem, 'className') and 'TextExpression' in elem.className:
                     text = str(elem).lower()
                     if any(marker in text for marker in
@@ -1588,7 +1515,6 @@ class MusicXMLtoPDFConverter:
         except:
             pass
 
-        # Анализ на основе изменений текстуры
         texture_changes = self._analyze_texture_changes(score)
 
         return {
@@ -1628,8 +1554,6 @@ class MusicXMLtoPDFConverter:
             total_measures = 0
             for part in score.parts:
                 total_measures = max(total_measures, len(part.getElementsByClass('Measure')))
-
-            # Простая оценка - можно улучшить
             return "Не определено"
         except:
             return "Не определено"
@@ -1641,7 +1565,6 @@ class MusicXMLtoPDFConverter:
         try:
             measures = list(score.parts[0].getElementsByClass('Measure')) if score.parts else []
             if len(measures) > 10:
-                # Анализируем каждые 10 тактов
                 for i in range(0, len(measures), 10):
                     if i + 10 < len(measures):
                         segment = measures[i:i + 10]
@@ -1657,7 +1580,6 @@ class MusicXMLtoPDFConverter:
 
     def _assess_texture(self, measures) -> str:
         """Оценивает текстуру сегмента."""
-        # Упрощенный анализ
         return "Смешанная"
 
     def _identify_form_type(self, sections, repeats, texture_changes) -> str:
@@ -1694,7 +1616,6 @@ class MusicXMLtoPDFConverter:
         difficulty_score = 0
         difficulty_factors = []
 
-        # 1. Диапазон
         pitches = []
         for n in notes:
             try:
@@ -1710,7 +1631,6 @@ class MusicXMLtoPDFConverter:
             if range_score > 3:
                 difficulty_factors.append(f"Широкий диапазон ({range_size} полутонов)")
 
-        # 2. Полифония
         max_notes_per_chord = 0
         try:
             flat_score = score.flatten()
@@ -1729,7 +1649,6 @@ class MusicXMLtoPDFConverter:
         if max_notes_per_chord >= 4:
             difficulty_factors.append(f"Сложные аккорды (до {max_notes_per_chord} нот)")
 
-        # 3. Быстрые ноты
         short_notes = 0
         for n in notes:
             try:
@@ -1746,9 +1665,7 @@ class MusicXMLtoPDFConverter:
             if short_note_percentage > 0.3:
                 difficulty_factors.append("Много быстрых нот")
 
-        # 4. Технические элементы
         try:
-            # Проверка артикуляции
             articulations_count = 0
             for n in notes:
                 if hasattr(n, 'articulations') and n.articulations:
@@ -1760,7 +1677,6 @@ class MusicXMLtoPDFConverter:
         except:
             pass
 
-        # Определяем уровень сложности
         if difficulty_score < 5:
             level = "Начальный"
         elif difficulty_score < 10:
@@ -1790,7 +1706,6 @@ class MusicXMLtoPDFConverter:
             notes = list(flat_score.notes)
 
             if notes:
-                # Анализ артикуляции
                 articulations = []
                 for note in notes:
                     try:
@@ -1799,7 +1714,6 @@ class MusicXMLtoPDFConverter:
                                 art_str = str(a)
                                 articulations.append(art_str)
 
-                                # Определяем стилистические индикаторы по артикуляции
                                 if "Staccato" in art_str:
                                     style_info["period_indicators"].append("Классическая/Романтическая артикуляция")
                                 if "Tenuto" in art_str:
@@ -1811,12 +1725,10 @@ class MusicXMLtoPDFConverter:
                     except:
                         continue
 
-                # Анализ динамики для стиля
                 dynamics_info = self._analyze_dynamics(score)
                 if dynamics_info["has_crescendo"] and dynamics_info["has_diminuendo"]:
                     style_info["stylistic_features"].append("Динамические контрасты")
 
-                # Анализ ритма
                 durations = []
                 for n in notes:
                     try:
@@ -1830,14 +1742,12 @@ class MusicXMLtoPDFConverter:
                     if syncopation:
                         style_info["genre_indicators"].append("Синкопированный ритм (джаз/поп)")
 
-                # Проверка наличия свинга
-                if self._detect_swing(durations):
-                    style_info["genre_indicators"].append("Свинговая ритмика (джаз)")
+                    if self._detect_swing(durations):
+                        style_info["genre_indicators"].append("Свинговая ритмика (джаз)")
 
         except Exception as e:
             print(f"   ⚠ Ошибка стилистического анализа: {e}")
 
-        # Убираем дубликаты
         style_info["period_indicators"] = list(set(style_info["period_indicators"]))
         style_info["genre_indicators"] = list(set(style_info["genre_indicators"]))
         style_info["stylistic_features"] = list(set(style_info["stylistic_features"]))
@@ -1846,13 +1756,11 @@ class MusicXMLtoPDFConverter:
 
     def _detect_syncopation(self, durations) -> bool:
         """Обнаруживает синкопирование."""
-        # Простая эвристика - наличие множества коротких нот с акцентами
         short_durations = [d for d in durations if d < 0.5]
         return len(short_durations) > len(durations) * 0.4
 
     def _detect_swing(self, durations) -> bool:
         """Обнаруживает свинговую ритмику."""
-        # Упрощенная проверка
         return False
 
     def _determine_ensemble_type(self, instrumentation_info) -> str:
@@ -1880,7 +1788,6 @@ class MusicXMLtoPDFConverter:
         harmony = metadata.get("harmonic_info", {})
         dynamics_info = metadata.get("dynamic_info", {})
 
-        # Анализ для предсказания жанра
         if stats.get("total_notes", 0) > 1000:
             predictions.append("Оркестровая музыка")
             confidence += 0.3
@@ -1918,7 +1825,6 @@ class MusicXMLtoPDFConverter:
             from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
             from reportlab.lib import colors
 
-            # Создаем документ
             doc = SimpleDocTemplate(output_pdf_path, pagesize=A4,
                                     topMargin=20 * mm, bottomMargin=20 * mm,
                                     leftMargin=20 * mm, rightMargin=20 * mm)
@@ -1926,7 +1832,6 @@ class MusicXMLtoPDFConverter:
             story = []
             styles = getSampleStyleSheet()
 
-            # Стили
             title_style = ParagraphStyle(
                 'TitleStyle',
                 parent=styles['Title'],
@@ -1975,7 +1880,6 @@ class MusicXMLtoPDFConverter:
                 alignment=TA_LEFT
             )
 
-            # Заголовок
             title_text = metadata.get('basic_info', {}).get('title', 'Без названия')
             composer = metadata.get('basic_info', {}).get('composer', 'Неизвестный композитор')
 
@@ -1985,7 +1889,6 @@ class MusicXMLtoPDFConverter:
             story.append(Paragraph(f"<b>Композитор:</b> {composer}", heading_style))
             story.append(Spacer(1, 10 * mm))
 
-            # 1. Основная информация
             story.append(Paragraph("1. ОСНОВНАЯ ИНФОРМАЦИЯ", subheading_style))
 
             basic_info = metadata.get('basic_info', {})
@@ -2007,7 +1910,6 @@ class MusicXMLtoPDFConverter:
 
             story.append(Spacer(1, 5 * mm))
 
-            # 2. Инструментовка
             story.append(Paragraph("2. ИНСТРУМЕНТОВКА", subheading_style))
 
             instr_info = metadata.get('instrumentation_info', {})
@@ -2023,11 +1925,10 @@ class MusicXMLtoPDFConverter:
 
             story.append(Spacer(1, 5 * mm))
 
-            # Инструменты по партиям
             parts = struct_info.get('parts', [])
             if parts:
                 story.append(Paragraph("<b>Инструменты по партиям:</b>", normal_style))
-                for part in parts[:10]:  # Показываем первые 10 партий
+                for part in parts[:10]:
                     part_name = part.get('part_name', '')
                     instrument = part.get('instrument', '')
                     measures = part.get('measures_count', 0)
@@ -2039,10 +1940,8 @@ class MusicXMLtoPDFConverter:
                         text += f", {register}"
                     text += ")"
                     story.append(Paragraph(text, info_style))
-
             story.append(Spacer(1, 10 * mm))
 
-            # 3. Гармонический анализ
             story.append(Paragraph("3. ГАРМОНИЧЕСКИЙ АНАЛИЗ", subheading_style))
 
             harmony_info = metadata.get('harmonic_info', {})
@@ -2056,7 +1955,6 @@ class MusicXMLtoPDFConverter:
             if key_sig.get('detected_key'):
                 story.append(Paragraph(f"<b>Тональность:</b> {key_sig['detected_key']}", info_style))
 
-            # Наиболее частые аккорды
             common_chords = harmony_info.get('most_common_chords', [])
             if common_chords:
                 story.append(Spacer(1, 3 * mm))
@@ -2067,7 +1965,6 @@ class MusicXMLtoPDFConverter:
 
             story.append(Spacer(1, 10 * mm))
 
-            # 4. Форма и структура
             story.append(Paragraph("4. ФОРМА И СТРУКТУРА", subheading_style))
 
             form_info = metadata.get('form_analysis', {})
@@ -2084,7 +1981,6 @@ class MusicXMLtoPDFConverter:
 
             story.append(Spacer(1, 10 * mm))
 
-            # 5. Статистика и сложность
             story.append(Paragraph("5. СТАТИСТИКА И СЛОЖНОСТЬ", subheading_style))
 
             stats_info = metadata.get('statistical_info', {})
@@ -2104,7 +2000,6 @@ class MusicXMLtoPDFConverter:
             story.append(
                 Paragraph(f"<b>Ритмическая сложность:</b> {stats_info.get('rhythmic_complexity', 0)}/10", info_style))
 
-            # Факторы сложности
             difficulty_factors = difficulty.get('factors', [])
             if difficulty_factors:
                 story.append(Spacer(1, 3 * mm))
@@ -2114,7 +2009,6 @@ class MusicXMLtoPDFConverter:
 
             story.append(Spacer(1, 10 * mm))
 
-            # 6. Жанр и стиль
             story.append(Paragraph("6. ЖАНР И СТИЛЬ", subheading_style))
 
             genre_prediction = analysis_info.get('genre_prediction', {})
@@ -2126,7 +2020,6 @@ class MusicXMLtoPDFConverter:
                 Paragraph(f"<b>Уверенность предсказания:</b> {genre_prediction.get('confidence', 0) * 100:.0f}%",
                           info_style))
 
-            # Жанровые индикаторы
             genre_indicators = style_indicators.get('genre_indicators', [])
             if genre_indicators:
                 story.append(Spacer(1, 3 * mm))
@@ -2134,7 +2027,6 @@ class MusicXMLtoPDFConverter:
                 for indicator in genre_indicators[:3]:
                     story.append(Paragraph(f"• {indicator}", info_style))
 
-            # Стилистические особенности
             stylistic_features = style_indicators.get('stylistic_features', [])
             if stylistic_features:
                 story.append(Spacer(1, 3 * mm))
@@ -2144,7 +2036,6 @@ class MusicXMLtoPDFConverter:
 
             story.append(Spacer(1, 15 * mm))
 
-            # Информация о конвертации
             story.append(Paragraph("ИНФОРМАЦИЯ О КОНВЕРТАЦИИ", subheading_style))
 
             conversion_info = metadata.get('conversion_info', {})
@@ -2156,13 +2047,11 @@ class MusicXMLtoPDFConverter:
             story.append(Paragraph(f"<b>Версия LilyPond:</b> {conversion_info.get('lilypond_version', 'Неизвестно')}",
                                    info_style))
 
-            # Строим документ
             doc.build(story)
             print(f"   ✓ PDF с метаданными создан: {Path(output_pdf_path).name}")
 
         except Exception as e:
             print(f"   ⚠ Ошибка при создании PDF с метаданными: {e}")
-            # Резервный вариант с простым созданием PDF
             try:
                 c = canvas.Canvas(output_pdf_path)
                 c.setFont("Helvetica", 14)
@@ -2193,9 +2082,11 @@ class MusicXMLtoPDFConverter:
                 shutil.copy2(pdf1_path, output_path)
                 print("   Не удалось объединить PDF файлы, сохранен только основной PDF")
 
+    # ========== ОСНОВНОЙ МЕТОД КОНВЕРТАЦИИ ==========
     def convert_file(self, input_path: str, output_path: Optional[str] = None,
                      scale_factor: float = 0.8, add_page_numbers: bool = False,
-                     include_metadata: bool = True, **kwargs: Any) -> str:
+                     include_metadata: bool = True, include_piano_roll: bool = False,
+                     **kwargs: Any) -> str:
         start_time = time.time()
         try:
             input_file = Path(input_path)
@@ -2214,7 +2105,6 @@ class MusicXMLtoPDFConverter:
             print(f"\nКонвертация: {input_file.name} -> {output_file.name}")
             print("-" * 50)
 
-            # Загрузка MusicXML файла
             print("1. Чтение MusicXML файла...")
             score = converter.parse(str(input_file))
             print(f"   ✓ Файл загружен: {input_file.name}")
@@ -2224,21 +2114,15 @@ class MusicXMLtoPDFConverter:
             if not score.metadata.title:
                 score.metadata.title = input_file.stem
 
-            # Извлекаем метаданные
             structural_metadata = None
             if include_metadata:
                 structural_metadata = self.extract_structural_metadata(score)
                 print(f"   ✓ Структурные метаданные извлечены")
-
                 metadata_json_path = output_file.with_suffix('.metadata.json')
                 with open(metadata_json_path, 'w', encoding='utf-8') as f:
                     json.dump(structural_metadata, f, indent=2, ensure_ascii=False)
                 print(f"   ✓ Метаданные сохранены в JSON: {metadata_json_path.name}")
-
-            # Подготовка LilyPond файла с улучшенным оформлением
             print("2. Подготовка LilyPond файла...")
-
-            # Получаем название и композитора безопасно
             title = ""
             composer = ""
             try:
@@ -2255,7 +2139,6 @@ class MusicXMLtoPDFConverter:
                 title = input_file.stem
                 composer = "Неизвестный"
 
-            # Экранируем специальные символы для LilyPond
             title = title.replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
             composer = composer.replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
 
@@ -2265,7 +2148,7 @@ class MusicXMLtoPDFConverter:
 \\header {{
     title = "{title}"
     composer = "{composer}"
-    tagline = ##f  % Убираем подпись LilyPond
+    tagline = ##f
 }}
 
 \\layout {{
@@ -2278,8 +2161,8 @@ class MusicXMLtoPDFConverter:
     \\context {{
         \\Score
         \\override SpacingSpanner.common-shortest-duration = #(ly:make-moment 1/16)
-        \\override BarNumber.break-visibility = ##(#f #f #f)  % Убираем номера тактов
-        \\remove "Page_turn_engraver"  % Убираем разрывы страниц для поворотов
+        \\override BarNumber.break-visibility = ##(#f #f #f)
+        \\remove "Page_turn_engraver"
     }}
 
     \\context {{
@@ -2296,11 +2179,9 @@ class MusicXMLtoPDFConverter:
     left-margin = 20 \\mm
     right-margin = 20 \\mm
 
-    % Убираем номера страниц
     print-page-number = ##f
     print-first-page-number = ##f
 
-    % Улучшаем качество печати
     oddHeaderMarkup = ##f
     evenHeaderMarkup = ##f
     oddFooterMarkup = ##f
@@ -2309,17 +2190,14 @@ class MusicXMLtoPDFConverter:
 """
             temp_ly_file = output_file.with_suffix('.temp.ly')
 
-            # Сохраняем score в LilyPond формате
             try:
                 score.write('lilypond', fp=str(temp_ly_file))
             except Exception as e:
                 print(f"   ⚠ Ошибка при сохранении LilyPond файла: {e}")
-                # Пробуем альтернативный метод
                 try:
-                    # Создаем упрощенный LilyPond файл
                     with open(temp_ly_file, 'w', encoding='utf-8') as f:
                         f.write(
-                            lilypond_settings + "\n\n" + "\\score {\n  \\new Staff {\n    c'4 d' e' f'\n  }\n  \\layout { }\n}")
+                            lilypond_settings + "\n\n\\score {\n  \\new Staff {\n    c'4 d' e' f'\n  }\n  \\layout { }\n}")
                     print(f"   ⚠ Создан упрощенный LilyPond файл")
                 except:
                     raise RuntimeError(f"Не удалось создать LilyPond файл: {e}")
@@ -2327,7 +2205,6 @@ class MusicXMLtoPDFConverter:
             with open(temp_ly_file, 'r', encoding='utf-8') as f:
                 ly_content = f.read()
 
-            # Вставляем настройки после версии LilyPond
             if '\\version' in ly_content:
                 lines = ly_content.split('\n')
                 new_lines = []
@@ -2336,12 +2213,10 @@ class MusicXMLtoPDFConverter:
                 for line in lines:
                     new_lines.append(line)
                     if '\\version' in line and not version_found:
-                        # Добавляем настройки после строки с версией
                         new_lines.append(lilypond_settings)
                         version_found = True
 
                 if not version_found:
-                    # Если не нашли версию, добавляем в начало
                     new_content = lilypond_settings + '\n' + ly_content
                 else:
                     new_content = '\n'.join(new_lines)
@@ -2354,12 +2229,10 @@ class MusicXMLtoPDFConverter:
             print(f"   ✓ LilyPond файл подготовлен: {temp_ly_file.name}")
             print(f"   Размер файла: {temp_ly_file.stat().st_size} байт")
 
-            # Компиляция PDF
             print("3. Компиляция PDF с помощью LilyPond...")
             output_dir = output_file.parent
             output_stem = output_file.stem
 
-            # Создаем временную директорию для вывода LilyPond
             temp_output_dir = output_dir / f"temp_{output_stem}"
             temp_output_dir.mkdir(exist_ok=True)
 
@@ -2383,9 +2256,8 @@ class MusicXMLtoPDFConverter:
 
                 print("   ", end='', flush=True)
 
-                # Ждем завершения процесса с таймаутом
                 try:
-                    stdout, stderr = process.communicate(timeout=60)  # 60 секунд таймаут
+                    stdout, stderr = process.communicate(timeout=60)
 
                     if process.returncode != 0:
                         print(f"\n   ✗ Ошибка компиляции LilyPond (код {process.returncode})")
@@ -2394,11 +2266,9 @@ class MusicXMLtoPDFConverter:
                         if stdout:
                             print(f"   Вывод LilyPond:\n{stdout[:1000]}")
 
-                        # Проверяем, есть ли какие-то выходные файлы
                         pdf_files = list(temp_output_dir.glob("*.pdf"))
                         if pdf_files:
                             print(f"   Найдены PDF файлы: {[f.name for f in pdf_files]}")
-                            # Пробуем скопировать первый найденный PDF
                             pdf_files[0].rename(output_file)
                             print(f"   PDF найден и переименован: {pdf_files[0].name} -> {output_file.name}")
                             actual_pdf = output_file
@@ -2416,10 +2286,8 @@ class MusicXMLtoPDFConverter:
                 if temp_ly_file.exists():
                     temp_ly_file.unlink()
                 if temp_output_dir.exists():
-                    # Пробуем найти PDF в других местах
                     pdf_files = list(output_dir.glob(f"*.pdf"))
                     if pdf_files:
-                        # Ищем PDF с похожим именем
                         for pdf in pdf_files:
                             if output_stem in pdf.name:
                                 pdf.rename(output_file)
@@ -2433,34 +2301,25 @@ class MusicXMLtoPDFConverter:
                 else:
                     raise RuntimeError(f"LilyPond ошибка: {str(e)}")
 
-            # Удаляем временные файлы
             if temp_ly_file.exists():
                 temp_ly_file.unlink()
                 print(f"   ✓ Временный файл удален: {temp_ly_file.name}")
-
-            # Ищем созданный PDF файл
             actual_pdf = None
 
-            # 1. Ищем в временной директории
             if temp_output_dir.exists():
                 pdf_files = list(temp_output_dir.glob("*.pdf"))
                 if pdf_files:
-                    # Берем первый PDF файл
                     pdf_file = pdf_files[0]
-                    # Копируем в целевую директорию
                     pdf_file.rename(output_file)
                     actual_pdf = output_file
                     print(f"   ✓ PDF найден во временной директории: {pdf_file.name}")
                 else:
-                    # Ищем другие файлы в временной директории
                     all_files = list(temp_output_dir.glob("*"))
                     print(f"   Файлы во временной директории: {[f.name for f in all_files]}")
 
-            # 2. Ищем в основной директории
             if not actual_pdf or not actual_pdf.exists():
                 pdf_files = list(output_dir.glob(f"{output_stem}*.pdf"))
                 if pdf_files:
-                    # Находим самый свежий PDF
                     pdf_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
                     actual_pdf = pdf_files[0]
                     if actual_pdf != output_file:
@@ -2468,11 +2327,9 @@ class MusicXMLtoPDFConverter:
                         actual_pdf = output_file
                     print(f"   ✓ PDF найден в основной директории: {actual_pdf.name}")
 
-            # 3. Ищем любой PDF в директории
             if not actual_pdf or not actual_pdf.exists():
                 pdf_files = list(output_dir.glob("*.pdf"))
                 if pdf_files:
-                    # Ищем PDF с наиболее подходящим именем
                     for pdf in pdf_files:
                         if output_stem.lower() in pdf.name.lower():
                             pdf.rename(output_file)
@@ -2480,7 +2337,6 @@ class MusicXMLtoPDFConverter:
                             print(f"   ✓ PDF найден по части имени: {pdf.name}")
                             break
                     else:
-                        # Берем самый свежий PDF
                         pdf_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
                         actual_pdf = pdf_files[0]
                         new_name = output_dir / f"{output_stem}.pdf"
@@ -2491,7 +2347,6 @@ class MusicXMLtoPDFConverter:
             if not actual_pdf or not actual_pdf.exists():
                 raise FileNotFoundError(f"PDF файл не был создан. Проверьте вывод LilyPond выше.")
 
-            # Очищаем временные файлы
             for ext in ['.log', '.tex', '.count', '.eps', '.png', '.svg']:
                 temp_file = output_dir / f"{output_stem}{ext}"
                 if temp_file.exists():
@@ -2500,7 +2355,6 @@ class MusicXMLtoPDFConverter:
                     except:
                         pass
 
-            # Удаляем временную директорию
             if temp_output_dir.exists():
                 try:
                     for file in temp_output_dir.glob("*"):
@@ -2532,6 +2386,24 @@ class MusicXMLtoPDFConverter:
                     print(f"   ⚠ Ошибка при добавлении метаданных: {e}")
                     print(f"   PDF сохранен без метаданных")
 
+            # Добавление пиано-ролла
+            if include_piano_roll and actual_pdf:
+                print("5. Добавление пиано-ролла в PDF...")
+                try:
+                    piano_roll_path = output_dir / f"{output_stem}_pianoroll.pdf"
+                    self.generate_piano_roll_pdf(score, str(piano_roll_path))
+
+                    temp_merged = output_dir / f"{output_stem}_with_pianoroll.pdf"
+                    self.merge_pdfs(str(actual_pdf), str(piano_roll_path), str(temp_merged))
+
+                    actual_pdf.unlink()
+                    temp_merged.rename(actual_pdf)
+                    piano_roll_path.unlink()
+
+                    print(f"   ✓ Пиано-ролл добавлен в PDF")
+                except Exception as e:
+                    print(f"   ⚠ Ошибка при добавлении пиано-ролла: {e}")
+
             elapsed_time = time.time() - start_time
             file_size = actual_pdf.stat().st_size / 1024
 
@@ -2550,14 +2422,12 @@ class MusicXMLtoPDFConverter:
             print(f"\n✗ Ошибка при конвертации:")
             print(f"  {type(e).__name__}: {str(e)}")
 
-            # Дополнительная диагностика
             print(f"\nДИАГНОСТИКА:")
             print(f"  Входной файл: {input_path}")
             print(f"  Выходной файл: {output_path if output_path else 'Не указан'}")
             print(f"  LilyPond путь: {self.lilypond_path}")
             print(f"  LilyPond доступен: {os.path.exists(self.lilypond_path) if self.lilypond_path else 'Нет'}")
 
-            # Проверяем временные файлы
             try:
                 if 'temp_ly_file' in locals() and temp_ly_file.exists():
                     print(f"  LilyPond файл создан: Да ({temp_ly_file.stat().st_size} байт)")
@@ -2573,7 +2443,7 @@ class MusicXMLtoPDFConverter:
             raise
 
     def batch_convert(self, input_files: List[str], output_dir: Optional[str] = None,
-                      include_metadata: bool = True) -> List[str]:
+                      include_metadata: bool = True, include_piano_roll: bool = False) -> List[str]:
         results = []
         total_files = len(input_files)
         print(f"\nНачало пакетной конвертации {total_files} файлов")
@@ -2588,7 +2458,8 @@ class MusicXMLtoPDFConverter:
                     output_file = output_path / Path(input_file).with_suffix('.pdf').name
                 else:
                     output_file = None
-                result = self.convert_file(input_file, output_file, include_metadata=include_metadata)
+                result = self.convert_file(input_file, output_file, include_metadata=include_metadata,
+                                           include_piano_roll=include_piano_roll)
                 results.append(result)
                 print(f"   ✓ Успешно")
             except Exception as e:
@@ -2798,7 +2669,7 @@ def get_batch_files_from_user() -> List[str]:
 def main_menu():
     """Главное меню программы."""
     print("\n" + "=" * 60)
-    print("MUSICXML В PDF КОНВЕРТЕР СО СТРУКТУРНЫМИ МЕТАДАННЫМИ")
+    print("MUSICXML В PDF КОНВЕРТЕР СО СТРУКТУРНЫМИ МЕТАДАННЫМИ И ПИАНО-РОЛЛОМ")
     print("=" * 60)
     print("Программа для конвертации MusicXML файлов в PDF")
     print("Использует music21 и LilyPond для рендеринга")
@@ -2838,13 +2709,18 @@ def main_menu():
                         "Добавить структурные метаданные в PDF? (y/n, по умолчанию y): ").strip().lower()
                     include_metadata = metadata_choice != 'n'
 
+                    piano_roll_choice = input(
+                        "Добавить пиано-ролл (интервальную спектрограмму)? (y/n, по умолчанию n): ").strip().lower()
+                    include_piano_roll = piano_roll_choice == 'y'
+
                     # Выполняем конвертацию
                     print("\nНачало конвертации...")
                     result = converter.convert_file(
                         input_file,
                         output_file,
                         scale_factor=scale_factor,
-                        include_metadata=include_metadata
+                        include_metadata=include_metadata,
+                        include_piano_roll=include_piano_roll
                     )
 
                     print(f"\n✓ Конвертация завершена!")
@@ -2863,7 +2739,6 @@ def main_menu():
                 except Exception as e:
                     print(f"\n✗ Ошибка: {str(e)}")
                     print("Попробуйте снова.")
-
             elif choice == '2':  # Пакетная конвертация
                 try:
                     files = get_batch_files_from_user()
@@ -2875,11 +2750,31 @@ def main_menu():
                             "Добавить структурные метаданные в PDF? (y/n, по умолчанию y): ").strip().lower()
                         include_metadata = metadata_choice != 'n'
 
+                        piano_roll_choice = input(
+                            "Добавить пиано-ролл для каждого файла? (y/n, по умолчанию n): ").strip().lower()
+                        include_piano_roll = piano_roll_choice == 'y'
+
                         print("\nНачало пакетной конвертации...")
-                        results = converter.batch_convert(files, output_dir,
-                                                          include_metadata=include_metadata)
+                        results = converter.batch_convert(
+                            files,
+                            output_dir,
+                            include_metadata=include_metadata,
+                            include_piano_roll=include_piano_roll
+                        )
 
                         print("\nПакетная конвертация завершена!")
+
+                        # Показываем статистику
+                        successful = sum(1 for r in results if r is not None)
+                        failed = len(files) - successful
+                        print(f"  Успешно: {successful}")
+                        print(f"  Не удалось: {failed}")
+
+                        if failed > 0:
+                            print("\nФайлы с ошибками:")
+                            for i, (file, result) in enumerate(zip(files, results)):
+                                if result is None:
+                                    print(f"  • {Path(file).name}")
 
                 except Exception as e:
                     print(f"\n✗ Ошибка: {str(e)}")
@@ -2893,19 +2788,62 @@ def main_menu():
                 for key, value in info.items():
                     print(f"  {key}: {value}")
 
+                # Дополнительная информация о системе
+                print("\n  Системная информация:")
+                print(f"  Платформа: {sys.platform}")
+                print(f"  Python версия: {sys.version.split()[0]}")
+                print(
+                    f"  Music21 версия: {converter.__version__ if hasattr(converter, '__version__') else 'неизвестно'}")
+
             elif choice == '4':  # Тестирование LilyPond
                 print("\n" + "-" * 40)
                 print("ТЕСТИРОВАНИЕ LILYPOND")
                 print("-" * 40)
-                success = converter.test_lilypond()
-                if success:
-                    print("\n✓ LilyPond работает корректно")
-                else:
-                    print("\n✗ Проблемы с LilyPond. Проверьте установку.")
-                    print("Рекомендации:")
+
+                # Создаем простой тестовый файл
+                test_ly = Path("test_lilypond.ly")
+                test_pdf = Path("test_lilypond.pdf")
+
+                try:
+                    with open(test_ly, 'w', encoding='utf-8') as f:
+                        f.write('''
+\\version "2.24.0"
+\\header { title = "LilyPond Test" }
+\\score { \\new Staff { c' d' e' f' g' a' b' c'' } }
+                        ''')
+
+                    result = subprocess.run(
+                        [converter.lilypond_path, '--pdf', str(test_ly)],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+
+                    if result.returncode == 0 and test_pdf.exists():
+                        print("\n✓ LilyPond работает корректно")
+                        print("  Тестовый PDF создан успешно")
+
+                        # Удаляем тестовые файлы
+                        test_ly.unlink()
+                        test_pdf.unlink()
+                    else:
+                        print("\n✗ Проблемы с LilyPond. Проверьте установку.")
+                        if result.stderr:
+                            print(f"  Ошибка: {result.stderr[:200]}")
+
+                except Exception as e:
+                    print(f"\n✗ Ошибка при тестировании: {e}")
+                    print("\nРекомендации:")
                     print("1. Убедитесь, что LilyPond установлен")
                     print("2. Проверьте путь: C:\\Program Files\\LilyPond\\bin\\lilypond.exe")
                     print("3. Попробуйте переустановить LilyPond")
+                    print("4. Проверьте переменные окружения PATH")
+
+                # Очистка
+                if test_ly.exists():
+                    test_ly.unlink()
+                if test_pdf.exists():
+                    test_pdf.unlink()
 
             elif choice == '5':  # Выход
                 print("\nСпасибо за использование программы!")
@@ -2922,65 +2860,131 @@ def main_menu():
         print("2. Убедитесь, что установка в папку: C:\\Program Files\\LilyPond")
         print("3. Или укажите путь вручную при запуске:")
         print("   python lilypond.py --lilypond 'ваш\\путь\\lilypond.exe'")
+        print("\nАльтернативные пути:")
+        converter = MusicXMLtoPDFConverter()  # Временный объект для получения альтернативных путей
+        alt_paths = converter._get_alternative_lilypond_paths()
+        for path in alt_paths[:5]:
+            print(f"   • {path}")
 
     except Exception as e:
         print(f"\n✗ НЕИЗВЕСТНАЯ ОШИБКА: {type(e).__name__}: {e}")
         print("\nДетальная информация об ошибке:")
-        import traceback
         traceback.print_exc()
+
+        # Сохраняем лог ошибки
+        error_log = f"error_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(error_log, 'w', encoding='utf-8') as f:
+            f.write(f"Ошибка: {type(e).__name__}: {e}\n")
+            f.write(f"Время: {datetime.now()}\n")
+            f.write(f"Python: {sys.version}\n")
+            f.write(f"Платформа: {sys.platform}\n")
+            f.write("-" * 50 + "\n")
+            traceback.print_exc(file=f)
+        print(f"\nЛог ошибки сохранен в: {error_log}")
 
 
 def main():
     """Точка входа в программу."""
     # Парсинг аргументов командной строки
-    parser = argparse.ArgumentParser(description='Конвертер MusicXML в PDF со структурными метаданными')
-    parser.add_argument('--lilypond', type=str, help='Путь к LilyPond')
-    parser.add_argument('--input', type=str, help='Путь к входному файлу (без меню)')
-    parser.add_argument('--output', type=str, help='Путь к выходному файлу')
-    parser.add_argument('--batch', action='store_true', help='Пакетный режим')
-    parser.add_argument('--scale', type=float, default=0.8, help='Масштаб (по умолчанию 0.8)')
+    parser = argparse.ArgumentParser(
+        description='Конвертер MusicXML в PDF со структурными метаданными и пиано-роллом',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры использования:
+  python lilypond.py --input "file.xml" --output "file.pdf"
+  python lilypond.py --input "file.xml" --piano-roll --no-metadata
+  python lilypond.py --batch --input "scores/" --output "pdfs/"
+  python lilypond.py --batch --input "filelist.txt" --piano-roll
+        """
+    )
+
+    parser.add_argument('--lilypond', type=str,
+                        help='Путь к LilyPond (по умолчанию: C:\\Program Files\\LilyPond\\bin\\lilypond.exe)')
+    parser.add_argument('--input', type=str, help='Путь к входному файлу или директории (для пакетного режима)')
+    parser.add_argument('--output', type=str, help='Путь к выходному файлу или директории')
+    parser.add_argument('--batch', action='store_true', help='Пакетный режим (конвертировать несколько файлов)')
+    parser.add_argument('--scale', type=float, default=0.8, help='Масштаб страницы (0.5-1.5, по умолчанию 0.8)')
     parser.add_argument('--no-metadata', action='store_true', help='Не добавлять метаданные в PDF')
+    parser.add_argument('--piano-roll', action='store_true',
+                        help='Добавить пиано-ролл (интервальную спектрограмму) в PDF')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Подробный вывод')
 
     args = parser.parse_args()
 
     # Если указаны аргументы командной строки, используем их
     if args.input:
         try:
+            if args.verbose:
+                print("Запуск в режиме командной строки...")
+                print(f"Аргументы: {args}")
+
             if args.batch:
                 # Пакетный режим
                 input_files = []
+
                 if os.path.isdir(args.input):
                     # Если указана директория, ищем все MusicXML файлы
+                    input_path = Path(args.input)
                     for ext in ['*.xml', '*.mxl', '*.musicxml']:
-                        input_files.extend(Path(args.input).glob(ext))
+                        input_files.extend(str(p) for p in input_path.glob(ext))
+
+                    if args.verbose:
+                        print(f"Найдено {len(input_files)} файлов в директории {args.input}")
+
                 else:
                     # Если указан файл со списком
                     if args.input.endswith('.txt'):
-                        with open(args.input, 'r') as f:
-                            input_files = [line.strip() for line in f if line.strip()]
+                        try:
+                            with open(args.input, 'r', encoding='utf-8') as f:
+                                input_files = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                            if args.verbose:
+                                print(f"Загружено {len(input_files)} файлов из списка {args.input}")
+                        except Exception as e:
+                            print(f"Ошибка при чтении файла списка: {e}")
+                            sys.exit(1)
                     else:
                         input_files = [args.input]
 
+                if not input_files:
+                    print("Не найдено файлов для конвертации")
+                    sys.exit(1)
+
+                # Создаем конвертер
                 converter = MusicXMLtoPDFConverter(args.lilypond)
-                results = converter.batch_convert(input_files, args.output,
-                                                  include_metadata=not args.no_metadata)
-                print(f"Конвертация завершена. Успешно: {sum(1 for r in results if r)} файлов")
+
+                # Выполняем пакетную конвертацию
+                results = converter.batch_convert(
+                    input_files,
+                    args.output,
+                    include_metadata=not args.no_metadata,
+                    include_piano_roll=args.piano_roll
+                )
+
+                # Выводим статистику
+                successful = sum(1 for r in results if r is not None)
+                print(f"\nПакетная конвертация завершена. Успешно: {successful} из {len(input_files)} файлов")
 
             else:
                 # Одиночный файл
                 converter = MusicXMLtoPDFConverter(args.lilypond)
+
                 result = converter.convert_file(
                     args.input,
                     args.output,
                     scale_factor=args.scale,
-                    include_metadata=not args.no_metadata
+                    include_metadata=not args.no_metadata,
+                    include_piano_roll=args.piano_roll
                 )
+
                 print(f"Конвертация завершена: {result}")
 
         except Exception as e:
             print(f"Ошибка: {e}")
+            if args.verbose:
+                traceback.print_exc()
             sys.exit(1)
     else:
+        # Запускаем интерактивное меню
         main_menu()
 
 
