@@ -26,7 +26,11 @@ class ApplicationContainer(containers.DeclarativeContainer):
     )
 
     def _init_audio_to_music_inference():
+<<<<<<< HEAD
         sys.path.insert(0, str(Path.cwd()) + '/model')
+=======
+        sys.path.insert(0, str(Path.cwd().parent) + '/model')
+>>>>>>> db8eeaeeb8b4391230bee846a25c2de1e8931d8b
         spec = spec_from_file_location("model", str(Path.cwd()) + '/model/model.py')
         module = module_from_spec(spec)
         sys.modules["model"] = module

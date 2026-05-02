@@ -4,5 +4,9 @@ midi-musicxml/__pycache__/
 **.wav
 **.mid
 **.musicxml
+<<<<<<< HEAD
 **/__pycache__/
 .env
+=======
+**/__pycache__/
+>>>>>>> db8eeaeeb8b4391230bee846a25c2de1e8931d8b
